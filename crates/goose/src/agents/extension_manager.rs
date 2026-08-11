@@ -312,6 +312,31 @@ fn recover_mangled_tool_name<'a>(
     matched.map(|s| s.to_string())
 }
 
+fn governed_shell_tool_name(requested: &str, tools: &[Tool], governed: bool) -> Option<String> {
+    if !governed || requested != "shell" {
+        return None;
+    }
+
+    let exactcode_owner = name_to_key("exactcode-host");
+    let mut matched: Option<&str> = None;
+    for tool in tools {
+        let name = tool.name.as_ref();
+        let actual = name
+            .split_once("__")
+            .map(|(_, actual)| actual)
+            .unwrap_or(name);
+        if actual != "shell.exec"
+            || get_tool_owner(tool).as_deref() != Some(exactcode_owner.as_str())
+        {
+            continue;
+        }
+        if matched.replace(name).is_some() {
+            return None;
+        }
+    }
+    matched.map(str::to_string)
+}
+
 fn get_tool_meta_value(tool: &Tool) -> Option<Value> {
     tool.meta.as_ref().map(|meta| Value::Object(meta.0.clone()))
 }
@@ -1764,7 +1789,9 @@ impl ExtensionManager {
             )
         })?;
 
-        let mut name = tool_name.to_string();
+        let governed = std::env::var("EXACTCODE_GOVERNED_SESSION").as_deref() == Ok("1");
+        let mut name = governed_shell_tool_name(tool_name, &tools, governed)
+            .unwrap_or_else(|| tool_name.to_string());
         let mut recovery_attempted = false;
         loop {
             if let Some(tool) = tools.iter().find(|t| *t.name == *name) {
@@ -3123,6 +3150,35 @@ mod tests {
             recover_mangled_tool_name("dotted.db.query", dotted_tool.iter().copied()).as_deref(),
             Some("dotted__db.query")
         );
+    }
+
+    #[test]
+    fn governed_bang_shell_resolves_only_the_exactcode_host_tool() {
+        fn tool(name: &str, owner: &str) -> Tool {
+            let mut tool = Tool::new(
+                name.to_string(),
+                "test".to_string(),
+                Arc::new(serde_json::Map::new()),
+            );
+            tool.meta = Some(MetaObject(serde_json::Map::from_iter([(
+                TOOL_EXTENSION_META_KEY.to_string(),
+                Value::String(owner.to_string()),
+            )])));
+            tool
+        }
+
+        let host = tool("exactcode-host__shell.exec", "exactcode-host");
+        let attacker = tool("project_plugin__shell.exec", "project_plugin");
+
+        assert_eq!(
+            governed_shell_tool_name("shell", &[host.clone(), attacker], true).as_deref(),
+            Some("exactcode-host__shell.exec")
+        );
+        assert_eq!(
+            governed_shell_tool_name("shell", std::slice::from_ref(&host), false),
+            None
+        );
+        assert_eq!(governed_shell_tool_name("other", &[host], true), None);
     }
 
     #[test]

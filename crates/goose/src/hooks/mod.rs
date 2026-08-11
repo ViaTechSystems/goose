@@ -38,7 +38,10 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 use tracing_futures::Instrument;
 
-use crate::plugins::discovery::{discover_enabled_plugins, DiscoveredPlugin};
+use crate::plugins::discovery::{
+    discover_enabled_plugins, project_plugin_policy, DiscoveredPlugin, PluginScope,
+    EXACTCODE_TRUST_PROJECT_PLUGINS_ENV,
+};
 
 /// Default per-hook timeout when the plugin does not specify one.
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
@@ -247,6 +250,34 @@ impl HookManager {
     }
 
     fn from_plugins(plugins: Vec<DiscoveredPlugin>, use_login_shell_path: bool) -> Self {
+        let policy = project_plugin_policy();
+        let project_plugin_count = plugins
+            .iter()
+            .filter(|plugin| plugin.scope == PluginScope::Project)
+            .count();
+        let plugins = if policy.governed && !policy.explicitly_trusted {
+            if project_plugin_count > 0 {
+                warn!(
+                    trust_environment = EXACTCODE_TRUST_PROJECT_PLUGINS_ENV,
+                    project_plugin_count,
+                    "Blocked project plugin command hooks in ExactCode-governed session"
+                );
+            }
+            plugins
+                .into_iter()
+                .filter(|plugin| plugin.scope != PluginScope::Project)
+                .collect()
+        } else {
+            if policy.governed && policy.explicitly_trusted && project_plugin_count > 0 {
+                warn!(
+                    trust_environment = EXACTCODE_TRUST_PROJECT_PLUGINS_ENV,
+                    project_plugin_count,
+                    "Operator trust override enabled for project plugin command hooks in ExactCode-governed session"
+                );
+            }
+            plugins
+        };
+
         let mut rules: HashMap<HookEvent, Vec<LoadedRule>> = HashMap::new();
         let mut total = 0usize;
 
@@ -690,7 +721,7 @@ fn expand_plugin_root(command: &str, plugin_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::discovery::{DiscoveredPlugin, PluginScope};
+    use crate::plugins::discovery::EXACTCODE_GOVERNED_SESSION_ENV;
 
     fn write_plugin(root: &Path, name: &str, hooks_json: &str) -> PathBuf {
         let plugin = root.join(name);
@@ -775,6 +806,118 @@ mod tests {
 
         let written = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(written.trim(), root.to_string_lossy());
+    }
+
+    fn session_start_marker_plugin(
+        root: &Path,
+        name: &str,
+        marker: &Path,
+        scope: PluginScope,
+    ) -> DiscoveredPlugin {
+        let hooks = format!(
+            r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"touch {}"}}]}}]}}}}"#,
+            marker.to_string_lossy(),
+        );
+        DiscoveredPlugin {
+            name: name.to_string(),
+            root: write_plugin(root, name, &hooks),
+            scope,
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_session_does_not_execute_project_session_start_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("project-ran");
+        let plugin =
+            session_start_marker_plugin(tmp.path(), "project", &marker, PluginScope::Project);
+        let _guard = env_lock::lock_env([
+            (EXACTCODE_GOVERNED_SESSION_ENV, Some("1")),
+            (EXACTCODE_TRUST_PROJECT_PLUGINS_ENV, None::<&str>),
+        ]);
+
+        let manager = make_manager(vec![plugin]);
+        manager
+            .emit(
+                HookEvent::SessionStart,
+                HookContext::new(HookEvent::SessionStart, "governed"),
+            )
+            .await;
+
+        assert!(!marker.exists(), "untrusted project hook executed");
+    }
+
+    #[tokio::test]
+    async fn governed_session_preserves_installed_user_session_start_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("user-ran");
+        let plugin = session_start_marker_plugin(tmp.path(), "user", &marker, PluginScope::User);
+        let _guard = env_lock::lock_env([
+            (EXACTCODE_GOVERNED_SESSION_ENV, Some("1")),
+            (EXACTCODE_TRUST_PROJECT_PLUGINS_ENV, None::<&str>),
+        ]);
+
+        let manager = make_manager(vec![plugin]);
+        manager
+            .emit(
+                HookEvent::SessionStart,
+                HookContext::new(HookEvent::SessionStart, "governed"),
+            )
+            .await;
+
+        assert!(marker.exists(), "installed user hook should remain enabled");
+    }
+
+    #[tokio::test]
+    async fn operator_trust_executes_project_session_start_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("trusted-project-ran");
+        let plugin = session_start_marker_plugin(
+            tmp.path(),
+            "trusted-project",
+            &marker,
+            PluginScope::Project,
+        );
+        let _guard = env_lock::lock_env([
+            (EXACTCODE_GOVERNED_SESSION_ENV, Some("1")),
+            (EXACTCODE_TRUST_PROJECT_PLUGINS_ENV, Some("1")),
+        ]);
+
+        let manager = make_manager(vec![plugin]);
+        manager
+            .emit(
+                HookEvent::SessionStart,
+                HookContext::new(HookEvent::SessionStart, "trusted"),
+            )
+            .await;
+
+        assert!(marker.exists(), "operator-trusted project hook did not run");
+    }
+
+    #[tokio::test]
+    async fn ordinary_goose_executes_project_session_start_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ordinary-project-ran");
+        let plugin = session_start_marker_plugin(
+            tmp.path(),
+            "ordinary-project",
+            &marker,
+            PluginScope::Project,
+        );
+        let _guard = env_lock::lock_env([
+            (EXACTCODE_GOVERNED_SESSION_ENV, None::<&str>),
+            (EXACTCODE_TRUST_PROJECT_PLUGINS_ENV, None::<&str>),
+        ]);
+
+        let manager = make_manager(vec![plugin]);
+        manager
+            .emit(
+                HookEvent::SessionStart,
+                HookContext::new(HookEvent::SessionStart, "ordinary"),
+            )
+            .await;
+
+        assert!(marker.exists(), "ordinary Goose project hook did not run");
     }
 
     #[tokio::test]

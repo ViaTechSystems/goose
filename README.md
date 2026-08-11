@@ -68,6 +68,10 @@ The fork's interactive CLI adds coding-session controls directly to goose:
 - `/new`, `/resume`, `/fork`, `/rename`, and `/sessions` manage durable sessions;
   `/diff`, `/review`, `/goal`, `/queue`, and `/status` expose coding workflow
   state.
+- A private checkpoint is captured before each submitted prompt and direct
+  `/agent` delegation. `/rewind` can restore the conversation, Git-backed code,
+  or both after confirmation, or create a non-destructive session fork from an
+  earlier checkpoint.
 - `/image` queues validated PNG, JPEG, or WebP attachments for the next turn;
   `/images` inspects or clears them.
 - `/subagents`, `/agent`, `/ps`, and `/stop` manage governed parallel work and
@@ -75,6 +79,12 @@ The fork's interactive CLI adds coding-session controls directly to goose:
 - While a response streams, `Enter` steers the active turn and `Tab` queues a
   distinct next turn. `Ctrl+J` inserts a newline, and `/edit` opens the prompt
   editor.
+
+In an ExactCode-governed session, repository-provided goose plugins, command
+hooks, and plugin MCP servers are blocked by default. An operator can explicitly
+trust them for that launch with `EXACTCODE_TRUST_PROJECT_PLUGINS=1`; plugin hook
+commands then run with the user's operating-system permissions and must be
+reviewed as executable code.
 
 See the [CLI command guide](https://goose-docs.ai/docs/guides/goose-cli-commands#interactive-session-features)
 for command arguments, limits, and key behavior.

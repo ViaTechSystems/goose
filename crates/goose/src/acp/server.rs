@@ -72,6 +72,74 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const EXACTCODE_GOVERNED_SESSION_ENV: &str = "EXACTCODE_GOVERNED_SESSION";
+const EXACTCODE_CAPABILITY_MODE_ENV: &str = "EXACTCODE_CAPABILITY_MODE";
+const EXACTCODE_HOST_EXTENSION: &str = "exactcode-host";
+
+fn exactcode_governed_session() -> bool {
+    std::env::var(EXACTCODE_GOVERNED_SESSION_ENV).as_deref() == Ok("1")
+}
+
+fn governed_mode_allowed(governed: bool, capability_mode: Option<&str>, mode: GooseMode) -> bool {
+    !governed || mode != GooseMode::Auto || capability_mode == Some("read_only")
+}
+
+fn governed_auto_mode_allowed() -> bool {
+    governed_mode_allowed(
+        exactcode_governed_session(),
+        std::env::var(EXACTCODE_CAPABILITY_MODE_ENV).ok().as_deref(),
+        GooseMode::Auto,
+    )
+}
+
+fn validate_governed_provider(
+    governed: bool,
+    current: &str,
+    requested: &str,
+) -> Result<(), String> {
+    if governed && (current != "openai" || requested != "openai") {
+        return Err(format!(
+            "ExactCode-governed ACP sessions use only the 'openai' gateway shim provider; cannot switch from '{current}' to '{requested}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_governed_session_provider(
+    governed: bool,
+    saved: Option<&str>,
+    resolved_default: Option<&str>,
+) -> Result<(), String> {
+    if !governed {
+        return Ok(());
+    }
+    let effective = saved.or(resolved_default).unwrap_or_default();
+    if effective != "openai" {
+        return Err(format!(
+            "ExactCode-governed ACP sessions require the 'openai' gateway shim provider; found '{effective}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_governed_extension_overrides(
+    governed: bool,
+    has_client_mcp: bool,
+    has_goose_extensions: bool,
+    has_recipe_extensions: bool,
+) -> Result<(), &'static str> {
+    if governed && (has_client_mcp || has_goose_extensions || has_recipe_extensions) {
+        return Err(
+            "ExactCode-governed ACP sessions cannot add client, recipe, or project extensions; use the session-scoped exactcode-host bridge",
+        );
+    }
+    Ok(())
+}
+
+fn should_rebuild_extension_data(governed: bool, has_client_mcp: bool, has_state: bool) -> bool {
+    governed || has_client_mcp || !has_state
+}
 use url::Url;
 use uuid::Uuid;
 
@@ -759,6 +827,29 @@ impl GooseAcpAgent {
     ) -> Result<Vec<ExtensionConfig>, agent_client_protocol::Error> {
         let mut extensions = selected_builtin_extensions(config, &self.builtin_selection);
 
+        if exactcode_governed_session() {
+            validate_governed_extension_overrides(
+                true,
+                !mcp_servers.is_empty(),
+                goose_extensions
+                    .as_ref()
+                    .is_some_and(|items| !items.is_empty()),
+                recipe_extensions.is_some_and(|items| !items.is_empty()),
+            )
+            .map_err(|message| agent_client_protocol::Error::invalid_params().data(message))?;
+            // The private ExactCode projection is the sole dynamic authority.
+            // Raw developer tools and repo-controlled plugin MCP servers would
+            // bypass its capability and allow/deny checks.
+            extensions.retain(|extension| extension.name() != "developer");
+            for extension in get_enabled_extensions_with_config(config)
+                .into_iter()
+                .filter(|extension| extension.name() == EXACTCODE_HOST_EXTENSION)
+            {
+                push_or_replace_extension(&mut extensions, extension);
+            }
+            return Ok(extensions);
+        }
+
         if let Some(recipe_extensions) = recipe_extensions {
             for extension in recipe_extensions {
                 push_or_replace_extension(&mut extensions, extension.clone());
@@ -875,6 +966,28 @@ impl GooseAcpAgent {
         include_messages_on_reload: bool,
     ) -> Result<Session, agent_client_protocol::Error> {
         let config = Config::global();
+        let resolved_defaults = if session.provider_name.is_none() || session.model_config.is_none()
+        {
+            Some(resolve_default_provider_model_config(config)?)
+        } else {
+            None
+        };
+        if exactcode_governed_session() {
+            if let Err(message) = validate_governed_session_provider(
+                true,
+                session.provider_name.as_deref(),
+                resolved_defaults.as_ref().map(|(name, _)| name.as_str()),
+            ) {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data(format!("saved session '{}': {message}", session.id,)));
+            }
+            if session.goose_mode == GooseMode::Auto && !governed_auto_mode_allowed() {
+                return Err(agent_client_protocol::Error::invalid_params().data(format!(
+                    "ExactCode-governed ACP session '{}' saved Auto mode but its host bridge is writable; choose ask or accept-edit",
+                    session.id,
+                )));
+            }
+        }
         let mut builder = self.session_manager.update(&session.id);
         let mut session_needs_update = false;
 
@@ -883,18 +996,18 @@ impl GooseAcpAgent {
             session_needs_update = true;
         }
 
-        if session.provider_name.is_none() || session.model_config.is_none() {
-            let (resolved_provider, resolved_model_config) =
-                resolve_default_provider_model_config(config)?;
+        if let Some((resolved_provider, resolved_model_config)) = resolved_defaults {
             builder = builder
                 .provider_name(resolved_provider)
                 .model_config(resolved_model_config);
             session_needs_update = true;
         }
 
-        if !mcp_servers.is_empty()
-            || EnabledExtensionsState::from_extension_data(&session.extension_data).is_none()
-        {
+        if should_rebuild_extension_data(
+            exactcode_governed_session(),
+            !mcp_servers.is_empty(),
+            EnabledExtensionsState::from_extension_data(&session.extension_data).is_some(),
+        ) {
             let extension_data =
                 self.build_enabled_extensions_data(config, &session, mcp_servers, None, None)?;
             builder = builder.extension_data(extension_data);
@@ -2110,6 +2223,11 @@ impl GooseAcpAgent {
             agent_client_protocol::Error::invalid_params()
                 .data(format!("Invalid mode: {}", mode_id))
         })?;
+        if mode == GooseMode::Auto && !governed_auto_mode_allowed() {
+            return Err(agent_client_protocol::Error::invalid_params().data(
+                "Auto/no-prompts mode is unavailable because this ExactCode-governed ACP session has a writable host bridge; restart under a read-only ExactCode capability",
+            ));
+        }
 
         let agent = self.get_session_agent(session_id).await?;
         agent
@@ -2170,6 +2288,12 @@ impl GooseAcpAgent {
         } else {
             provider_name.to_string()
         };
+        validate_governed_provider(
+            exactcode_governed_session(),
+            current_provider_name,
+            &resolved_provider_name,
+        )
+        .map_err(|message| agent_client_protocol::Error::invalid_params().data(message))?;
         let is_changing_provider = resolved_provider_name != current_provider_name;
         let default_model = if let Some(model_name) = model_name {
             model_name.to_string()
@@ -2527,6 +2651,67 @@ print(\"hello, world\")
         );
 
         assert_eq!(result, expected,)
+    }
+
+    #[test]
+    fn governed_acp_rejects_forged_auto_on_a_writable_bridge() {
+        assert!(!governed_mode_allowed(
+            true,
+            Some("workspace_write"),
+            GooseMode::Auto,
+        ));
+        assert!(!governed_mode_allowed(
+            true,
+            Some("full_control"),
+            GooseMode::Auto,
+        ));
+        assert!(governed_mode_allowed(
+            true,
+            Some("read_only"),
+            GooseMode::Auto,
+        ));
+        assert!(governed_mode_allowed(
+            true,
+            Some("workspace_write"),
+            GooseMode::SmartApprove,
+        ));
+    }
+
+    #[test]
+    fn governed_acp_rejects_every_non_gateway_provider_transition() {
+        assert!(validate_governed_provider(true, "openai", "openai").is_ok());
+        assert!(validate_governed_provider(true, "openai", "anthropic")
+            .unwrap_err()
+            .contains("gateway shim"));
+        assert!(validate_governed_provider(true, "anthropic", "openai").is_err());
+        assert!(validate_governed_provider(false, "openai", "anthropic").is_ok());
+        assert!(
+            validate_governed_session_provider(true, None, Some("anthropic"))
+                .unwrap_err()
+                .contains("gateway shim")
+        );
+        assert!(validate_governed_session_provider(true, None, Some("openai")).is_ok());
+    }
+
+    #[test]
+    fn governed_acp_rejects_forged_extensions_and_rebuilds_saved_state() {
+        for forged in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(
+                validate_governed_extension_overrides(true, forged.0, forged.1, forged.2,)
+                    .unwrap_err()
+                    .contains("exactcode-host")
+            );
+        }
+        assert!(validate_governed_extension_overrides(true, false, false, false).is_ok());
+        assert!(validate_governed_extension_overrides(false, true, true, true).is_ok());
+
+        assert!(should_rebuild_extension_data(true, false, true));
+        assert!(should_rebuild_extension_data(false, true, true));
+        assert!(!should_rebuild_extension_data(false, false, true));
     }
 
     #[test_case(

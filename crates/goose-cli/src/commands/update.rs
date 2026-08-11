@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const RELEASE_REPOSITORY: &str = "ViaTechSystems/goose";
+const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 256;
 
 fn attestation_url(digest: &str) -> String {
     format!(
@@ -94,6 +97,12 @@ struct AttestationEntry {
 }
 
 const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+fn workflow_identity_matches(identity: &str, workflow: &str) -> bool {
+    let expected =
+        format!("https://github.com/{RELEASE_REPOSITORY}/.github/workflows/{workflow}@refs/");
+    identity.starts_with(&expected)
+}
 
 fn sanitized_token(token: Option<&str>) -> Option<&str> {
     token.map(str::trim).filter(|tok| !tok.is_empty())
@@ -188,9 +197,8 @@ fn verify_bundle(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("No identity in certificate"))?;
 
-    let expected = format!("/.github/workflows/{workflow}");
-    if !identity.contains(&expected) {
-        bail!("Workflow mismatch: expected {workflow}, got {identity}");
+    if !workflow_identity_matches(identity, workflow) {
+        bail!("Workflow identity mismatch for {workflow}: got {identity}");
     }
 
     Ok(())
@@ -270,7 +278,7 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
         println!("Downloading {asset} from {tag} release...");
 
         // --- Download -----------------------------------------------------------
-        let response = reqwest::get(&url)
+        let mut response = reqwest::get(&url)
             .await
             .context("Failed to download release archive")?;
 
@@ -282,10 +290,28 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
             );
         }
 
-        let bytes = response
-            .bytes()
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
+        {
+            bail!("Release archive exceeds the 1 GiB safety limit");
+        }
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("Failed to read response body")?;
+            .context("Failed to read response body")?
+        {
+            let next_size = bytes
+                .len()
+                .checked_add(chunk.len())
+                .context("Release archive size overflow")?;
+            if next_size as u64 > MAX_ARCHIVE_BYTES {
+                bail!("Release archive exceeds the 1 GiB safety limit");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         println!("Downloaded {} bytes.", bytes.len());
 
@@ -310,12 +336,13 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
         let current_exe =
             env::current_exe().context("Failed to determine current executable path")?;
 
+        #[cfg(target_os = "windows")]
+        replace_windows_installation(&extracted_binary, &current_exe)
+            .context("Failed to replace Windows runtime")?;
+
+        #[cfg(not(target_os = "windows"))]
         replace_binary(&extracted_binary, &current_exe)
             .context("Failed to replace current binary")?;
-
-        // --- Copy DLLs on Windows -----------------------------------------------
-        #[cfg(target_os = "windows")]
-        copy_dlls(&extracted_binary, &current_exe)?;
 
         println!("goose updated successfully (verified with Sigstore SLSA provenance).");
 
@@ -349,6 +376,13 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<()> {
     let cursor = Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to open zip archive")?;
 
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        bail!("Zip archive contains too many entries");
+    }
+    let mut extracted_bytes = 0_u64;
+    let mut binary_count = 0_usize;
+    let mut normalized_names = std::collections::HashSet::new();
+
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -358,6 +392,40 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<()> {
             Some(p) => p.to_owned(),
             None => bail!("Zip entry has unsafe path: {}", entry.name()),
         };
+
+        let components: Vec<_> = safe_path.components().collect();
+        let file_name = safe_path.file_name().and_then(|name| name.to_str());
+        let allowed = entry.is_dir() && components.len() == 1 && file_name == Some("goose-package")
+            || !entry.is_dir()
+                && (components.len() == 1
+                    || components.len() == 2 && components[0].as_os_str() == "goose-package")
+                && file_name.is_some_and(|name| {
+                    name.eq_ignore_ascii_case("goose.exe")
+                        || name.to_ascii_lowercase().ends_with(".dll")
+                });
+        if !allowed {
+            bail!("Unexpected zip archive member: {}", safe_path.display());
+        }
+        let normalized_name = safe_path.to_string_lossy().to_ascii_lowercase();
+        if !normalized_names.insert(normalized_name) {
+            bail!("Zip archive contains duplicate case-insensitive member names");
+        }
+        if file_name.is_some_and(|name| name.eq_ignore_ascii_case("goose.exe")) {
+            binary_count += 1;
+        }
+        if let Some(mode) = entry.unix_mode() {
+            let file_type = mode & 0o170000;
+            let expected_type = if entry.is_dir() { 0o040000 } else { 0o100000 };
+            if file_type != 0 && file_type != expected_type {
+                bail!("Zip archive contains a link or special-file entry");
+            }
+        }
+        extracted_bytes = extracted_bytes
+            .checked_add(entry.size())
+            .context("Zip expanded-size overflow")?;
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            bail!("Zip archive exceeds the 4 GiB expanded-size safety limit");
+        }
 
         let target = dest.join(&safe_path);
 
@@ -370,6 +438,10 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<()> {
             let mut out = fs::File::create(&target)?;
             std::io::copy(&mut entry, &mut out)?;
         }
+    }
+
+    if binary_count != 1 {
+        bail!("Zip archive must contain exactly one goose.exe");
     }
 
     Ok(())
@@ -398,8 +470,15 @@ fn extract_tar_bz2(data: &[u8], dest: &Path) -> Result<()> {
     let decoder = BzDecoder::new(data);
     let mut archive = tar::Archive::new(decoder);
 
+    let mut entry_count = 0_usize;
+    let mut extracted_bytes = 0_u64;
+    let mut binary_count = 0_usize;
     for entry in archive.entries().context("Failed to read tar entries")? {
         let mut entry = entry.context("Failed to read tar entry")?;
+        entry_count += 1;
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            bail!("Tar archive contains too many entries");
+        }
         let path = entry
             .path()
             .context("Failed to read entry path")?
@@ -407,14 +486,34 @@ fn extract_tar_bz2(data: &[u8], dest: &Path) -> Result<()> {
 
         validate_entry_path(&path)?;
 
-        // Block symlinks and hardlinks whose targets escape the destination directory.
-        // Use entry.link_name() (not entry.header().link_name()) so GNU/PAX extended
-        // metadata (linkpath) is resolved; the header field alone may be truncated.
-        let link_target_opt = entry
-            .link_name()
-            .context("Failed to read link name from tar entry")?;
-        if let Some(link_target) = link_target_opt {
-            validate_entry_path(&link_target)?;
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            bail!("Tar archive contains a link or special-file entry");
+        }
+        let normal_components: Vec<_> = path
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .collect();
+        if entry_type.is_file() {
+            let allowed_binary = normal_components.len() == 1
+                && normal_components[0].as_os_str() == "goose"
+                || normal_components.len() == 2
+                    && normal_components[0].as_os_str() == "goose-package"
+                    && normal_components[1].as_os_str() == "goose";
+            if !allowed_binary {
+                bail!("Unexpected tar archive member: {}", path.display());
+            }
+            binary_count += 1;
+        } else if !(normal_components.is_empty()
+            || normal_components.len() == 1 && normal_components[0].as_os_str() == "goose-package")
+        {
+            bail!("Unexpected tar archive directory: {}", path.display());
+        }
+        extracted_bytes = extracted_bytes
+            .checked_add(entry.header().size().context("Invalid tar entry size")?)
+            .context("Tar expanded-size overflow")?;
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            bail!("Tar archive exceeds the 4 GiB expanded-size safety limit");
         }
 
         let target = dest.join(&path);
@@ -425,6 +524,10 @@ fn extract_tar_bz2(data: &[u8], dest: &Path) -> Result<()> {
         entry
             .unpack(&target)
             .with_context(|| format!("Failed to extract: {}", path.display()))?;
+    }
+
+    if binary_count != 1 {
+        bail!("Tar archive must contain exactly one goose binary");
     }
 
     Ok(())
@@ -477,109 +580,231 @@ fn find_binary(extract_dir: &Path, binary_name: &str) -> Option<PathBuf> {
 
 /// Replace the current binary with the newly downloaded one.
 ///
-/// On Windows we must rename the running exe (Windows allows rename but not
-/// delete/overwrite of a locked file) then copy the new file in.
-///
-/// On Unix we can simply copy over the existing binary.
+/// Stage the replacement beside the current executable so the final rename is
+/// same-filesystem and atomic. On Windows we must first rename the running exe
+/// to a unique rollback path because Windows does not replace locked files.
 fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
+    let install_dir = current_exe
+        .parent()
+        .context("Current executable has no parent directory")?;
+    let staged = tempfile::Builder::new()
+        .prefix(".goose-update-")
+        .tempfile_in(install_dir)
+        .context("Failed to reserve same-filesystem update staging file")?;
+    fs::copy(new_binary, staged.path()).with_context(|| {
+        format!(
+            "Failed to stage new binary beside {}",
+            current_exe.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(staged.path())?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(staged.path(), perms)?;
+    }
+
+    staged
+        .as_file()
+        .sync_all()
+        .context("Failed to flush staged update binary")?;
+    let (_, staged_path) = staged
+        .keep()
+        .map_err(|e| e.error)
+        .context("Failed to retain staged update binary")?;
+
+    let result = promote_staged_binary(&staged_path, current_exe);
+    if result.is_err() {
+        let _ = fs::remove_file(&staged_path);
+    }
+    result
+}
+
+fn promote_staged_binary(staged_path: &Path, current_exe: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        let old_exe = current_exe.with_extension("exe.old");
+        let install_dir = current_exe
+            .parent()
+            .context("Current executable has no parent directory")?;
+        // Best-effort migration cleanup for the fixed backup name used by
+        // older versions. A currently running image remains locked on Windows.
+        let _ = fs::remove_file(current_exe.with_extension("exe.old"));
+        let backup = tempfile::Builder::new()
+            .prefix(".goose-rollback-")
+            .tempfile_in(install_dir)
+            .context("Failed to reserve a unique rollback path")?;
+        let (_, old_exe) = backup
+            .keep()
+            .map_err(|e| e.error)
+            .context("Failed to retain rollback path")?;
+        fs::remove_file(&old_exe).context("Failed to prepare rollback path")?;
 
-        // Clean up leftover from a previous update
-        if old_exe.exists() {
-            fs::remove_file(&old_exe).with_context(|| {
+        // Rename the running binary out of the way
+        let had_current = current_exe.exists();
+        if had_current {
+            fs::rename(current_exe, &old_exe).with_context(|| {
                 format!(
-                    "Failed to remove old backup {}. Is another goose process running?",
+                    "Failed to rename running binary to {}. Try closing Goose Desktop if it's open.",
                     old_exe.display()
                 )
             })?;
         }
 
-        // Rename the running binary out of the way
-        fs::rename(current_exe, &old_exe).with_context(|| {
-            format!(
-                "Failed to rename running binary to {}. Try closing Goose Desktop if it's open.",
-                old_exe.display()
-            )
-        })?;
+        if let Err(error) = fs::rename(staged_path, current_exe) {
+            if had_current {
+                let _ = fs::rename(&old_exe, current_exe);
+            }
+            return Err(error)
+                .with_context(|| format!("Failed to promote {}", current_exe.display()));
+        }
 
-        // Copy the new binary into place
-        fs::copy(new_binary, current_exe).with_context(|| {
-            // Try to restore the old binary
-            let _ = fs::rename(&old_exe, current_exe);
-            format!("Failed to copy new binary to {}", current_exe.display())
-        })?;
+        if had_current {
+            let _ = fs::remove_file(&old_exe);
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let old_exe = current_exe.with_extension("old");
-
-        // Rename current binary to avoid ETXTBSY on Linux
-        if current_exe.exists() {
-            fs::rename(current_exe, &old_exe).with_context(|| {
-                format!("Failed to rename {} before update", current_exe.display())
-            })?;
-        }
-
-        if let Err(e) = fs::copy(new_binary, current_exe) {
-            // Restore old binary if copy fails
-            let _ = fs::rename(&old_exe, current_exe);
-            return Err(e).with_context(|| {
-                format!("Failed to copy new binary to {}", current_exe.display())
-            });
-        }
-
-        // Delete the old backup binary
-        let _ = fs::remove_file(&old_exe);
-
-        // Ensure the binary is executable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(current_exe)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(current_exe, perms)?;
-        }
+        fs::rename(staged_path, current_exe).with_context(|| {
+            format!(
+                "Failed to atomically promote update to {}",
+                current_exe.display()
+            )
+        })?;
     }
 
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// DLL handling (Windows only)
+// Transactional Windows runtime replacement
 // ---------------------------------------------------------------------------
 
-/// Copy any .dll files from the extracted archive alongside the installed binary.
 #[cfg(target_os = "windows")]
-fn copy_dlls(extracted_binary: &Path, current_exe: &Path) -> Result<()> {
+fn replace_windows_installation(extracted_binary: &Path, current_exe: &Path) -> Result<()> {
+    use std::ffi::OsString;
+
     let source_dir = extracted_binary
         .parent()
         .context("Extracted binary has no parent directory")?;
-    let dest_dir = current_exe
+    let install_dir = current_exe
         .parent()
         .context("Current executable has no parent directory")?;
 
-    if let Ok(entries) = fs::read_dir(source_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext.eq_ignore_ascii_case("dll") {
-                    let file_name = path.file_name().unwrap();
-                    let dest = dest_dir.join(file_name);
-                    // Remove existing DLL first (it may be locked by another process)
-                    if dest.exists() {
-                        let _ = fs::remove_file(&dest);
-                    }
-                    fs::copy(&path, &dest).with_context(|| {
-                        format!("Failed to copy {} to {}", path.display(), dest.display())
-                    })?;
-                    println!("  Copied {}", file_name.to_string_lossy());
-                }
-            }
+    let lock_path = install_dir.join(".goose-update.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .context("Failed to open update lock")?;
+    lock.try_lock()
+        .context("Another goose update is already promoting a Windows runtime")?;
+
+    let stage_temp = tempfile::Builder::new()
+        .prefix(".goose-stage-")
+        .tempdir_in(install_dir)
+        .context("Failed to create same-filesystem Windows staging directory")?;
+    let stage_dir = stage_temp.path().to_path_buf();
+    let rollback_temp = tempfile::Builder::new()
+        .prefix(".goose-rollback-")
+        .tempdir_in(install_dir)
+        .context("Failed to create Windows rollback directory")?;
+    let rollback_dir = rollback_temp.path().to_path_buf();
+
+    let binary_name = current_exe
+        .file_name()
+        .context("Current executable has no filename")?
+        .to_os_string();
+    let mut names = vec![binary_name.clone()];
+    fs::copy(extracted_binary, stage_dir.join(&binary_name))
+        .context("Failed to stage goose.exe")?;
+
+    for entry in fs::read_dir(source_dir).context("Failed to read extracted Windows runtime")? {
+        let entry = entry.context("Failed to read extracted Windows runtime entry")?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        {
+            let name = entry.file_name();
+            fs::copy(&path, stage_dir.join(&name))
+                .with_context(|| format!("Failed to stage Windows runtime {}", path.display()))?;
+            names.push(name);
         }
     }
+    names[1..].sort_by_key(|name| name.to_string_lossy().to_ascii_lowercase());
+
+    let mut backed_up: Vec<OsString> = Vec::new();
+    let mut promoted: Vec<OsString> = Vec::new();
+    let rollback = |promoted: &[OsString], backed_up: &[OsString]| -> Result<()> {
+        for name in promoted.iter().rev() {
+            let _ = fs::remove_file(install_dir.join(name));
+        }
+        for name in backed_up.iter().rev() {
+            fs::rename(rollback_dir.join(name), install_dir.join(name)).with_context(|| {
+                format!(
+                    "Rollback failed for {}; recovery files remain in {}",
+                    name.to_string_lossy(),
+                    rollback_dir.display()
+                )
+            })?;
+        }
+        Ok(())
+    };
+
+    // Remove the launchable executable first so a new process cannot observe a
+    // partially replaced DLL set. Promote all DLLs, then goose.exe last.
+    for name in &names {
+        let target = install_dir.join(name);
+        if target.exists() {
+            if let Err(error) = fs::rename(&target, rollback_dir.join(name)) {
+                if let Err(rollback_error) = rollback(&promoted, &backed_up) {
+                    let recovery_path = rollback_temp.keep();
+                    return Err(rollback_error).with_context(|| {
+                        format!(
+                            "Recovery files were preserved in {}",
+                            recovery_path.display()
+                        )
+                    });
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to prepare Windows runtime file {}",
+                        target.display()
+                    )
+                });
+            }
+            backed_up.push(name.clone());
+        }
+    }
+
+    for name in names.iter().skip(1).chain(std::iter::once(&binary_name)) {
+        if let Err(error) = fs::rename(stage_dir.join(name), install_dir.join(name)) {
+            if let Err(rollback_error) = rollback(&promoted, &backed_up) {
+                let recovery_path = rollback_temp.keep();
+                return Err(rollback_error).with_context(|| {
+                    format!(
+                        "Recovery files were preserved in {}",
+                        recovery_path.display()
+                    )
+                });
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to promote Windows runtime {}",
+                    name.to_string_lossy()
+                )
+            });
+        }
+        promoted.push(name.clone());
+    }
+
+    drop(stage_temp);
+    drop(rollback_temp);
+    drop(lock);
+    let _ = fs::remove_file(lock_path);
 
     Ok(())
 }
@@ -625,6 +850,26 @@ mod tests {
             "https://api.github.com/repos/ViaTechSystems/goose/attestations/sha256:abc123"
         ));
         assert!(!url.contains("aaif-goose"));
+    }
+
+    #[test]
+    fn provenance_identity_is_bound_to_fork_workflow_and_ref() {
+        assert!(workflow_identity_matches(
+            "https://github.com/ViaTechSystems/goose/.github/workflows/canary.yml@refs/heads/main",
+            "canary.yml"
+        ));
+        assert!(workflow_identity_matches(
+            "https://github.com/ViaTechSystems/goose/.github/workflows/release.yml@refs/tags/v1.46.0",
+            "release.yml"
+        ));
+        assert!(!workflow_identity_matches(
+            "https://github.com/attacker/goose/.github/workflows/canary.yml@refs/heads/main",
+            "canary.yml"
+        ));
+        assert!(!workflow_identity_matches(
+            "https://github.com/ViaTechSystems/goose/.github/workflows/not-canary.yml@refs/heads/main",
+            "canary.yml"
+        ));
     }
 
     #[test]
@@ -680,6 +925,69 @@ mod tests {
 
         let content = fs::read_to_string(&current).unwrap();
         assert_eq!(content, "new version");
+        assert!(fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".goose-")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_binary_replaces_symlink_without_clobbering_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        let current = tmp.path().join("goose");
+        let new_bin = tmp.path().join("new_goose");
+        fs::write(&victim, b"do not overwrite").unwrap();
+        fs::write(&new_bin, b"new version").unwrap();
+        symlink(&victim, &current).unwrap();
+
+        replace_binary(&new_bin, &current).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"do not overwrite");
+        assert_eq!(fs::read(&current).unwrap(), b"new version");
+        assert!(!fs::symlink_metadata(&current)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_replacements_leave_one_complete_binary_and_no_staging_files() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = Arc::new(tempdir().unwrap());
+        let current = tmp.path().join("goose");
+        fs::write(&current, b"old").unwrap();
+        let barrier = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+
+        for index in 0..8 {
+            let tmp = Arc::clone(&tmp);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let candidate = tmp.path().join(format!("candidate-{index}"));
+                let payload = format!("complete-{index}");
+                fs::write(&candidate, payload.as_bytes()).unwrap();
+                barrier.wait();
+                replace_binary(&candidate, &tmp.path().join("goose")).unwrap();
+            }));
+        }
+
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let installed = fs::read_to_string(&current).unwrap();
+        assert!((0..8).any(|index| installed == format!("complete-{index}")));
+        assert!(fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".goose-")));
     }
 
     #[cfg(target_os = "windows")]
@@ -698,11 +1006,13 @@ mod tests {
         let content = fs::read_to_string(&current).unwrap();
         assert_eq!(content, "new version");
 
-        // Old backup should exist
+        // Successful staging does not leave the legacy fixed backup behind.
         let old = current.with_extension("exe.old");
-        assert!(old.exists());
-        let old_content = fs::read_to_string(&old).unwrap();
-        assert_eq!(old_content, "old version");
+        assert!(!old.exists());
+        assert!(fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".goose-")));
     }
 
     #[cfg(target_os = "windows")]
@@ -723,9 +1033,8 @@ mod tests {
         let content = fs::read_to_string(&current).unwrap();
         assert_eq!(content, "version 3");
 
-        // Old should now contain version 2 (not version 1)
-        let old_content = fs::read_to_string(&old).unwrap();
-        assert_eq!(old_content, "version 2");
+        // The legacy fixed rollback path is retired and cleaned up.
+        assert!(!old.exists());
     }
 
     #[cfg(target_os = "windows")]
@@ -927,6 +1236,7 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_size(0);
             header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
             header.set_cksum();
             // Symlink whose target escapes the destination directory.
             builder
@@ -942,8 +1252,8 @@ mod tests {
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("path traversal"),
-            "error should mention path traversal, got: {err_msg}"
+            err_msg.contains("link or special-file"),
+            "error should identify the forbidden archive type, got: {err_msg}"
         );
     }
 }

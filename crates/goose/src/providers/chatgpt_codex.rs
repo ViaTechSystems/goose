@@ -252,7 +252,8 @@ fn reasoning_effort_for_config(model_config: &ModelConfig) -> Option<String> {
                 ThinkingEffort::Low => &["low", "medium", "high", "xhigh"],
                 ThinkingEffort::Medium => &["medium", "high", "low", "xhigh"],
                 ThinkingEffort::High => &["high", "medium", "xhigh", "low"],
-                ThinkingEffort::Max => &["xhigh", "high", "medium", "low"],
+                ThinkingEffort::XHigh => &["xhigh", "high", "medium", "low"],
+                ThinkingEffort::Max => &["max", "xhigh", "high", "medium", "low"],
             };
 
             preferred_levels

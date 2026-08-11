@@ -13,6 +13,16 @@ on:
   workflow_dispatch:
 
 jobs:
+  installer-security:
+    name: Test CLI installer security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Test private staging and atomic promotion
+        run: bash scripts/test_download_cli_security.sh
+
   changes:
     runs-on: ubuntu-latest
     outputs:

@@ -95,7 +95,7 @@ fn reasoning_effort_for_openrouter(effort: ThinkingEffort) -> Option<&'static st
         ThinkingEffort::Low => Some("low"),
         ThinkingEffort::Medium => Some("medium"),
         ThinkingEffort::High => Some("high"),
-        ThinkingEffort::Max => Some("xhigh"),
+        ThinkingEffort::XHigh | ThinkingEffort::Max => Some("xhigh"),
     }
 }
 

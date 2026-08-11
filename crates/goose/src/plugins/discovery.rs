@@ -7,6 +7,29 @@ use crate::config::{paths::Paths, Config};
 use crate::plugins::plugin_install_dir;
 
 const PLUGINS_CONFIG_KEY: &str = "plugins";
+pub(crate) const EXACTCODE_GOVERNED_SESSION_ENV: &str = "EXACTCODE_GOVERNED_SESSION";
+pub(crate) const EXACTCODE_TRUST_PROJECT_PLUGINS_ENV: &str = "EXACTCODE_TRUST_PROJECT_PLUGINS";
+
+/// Trust policy for repository-owned plugin components. The override is read
+/// only from the launching process environment, never from repository config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectPluginPolicy {
+    pub governed: bool,
+    pub explicitly_trusted: bool,
+}
+
+impl ProjectPluginPolicy {
+    pub(crate) fn allows_project(self) -> bool {
+        !self.governed || self.explicitly_trusted
+    }
+}
+
+pub(crate) fn project_plugin_policy() -> ProjectPluginPolicy {
+    ProjectPluginPolicy {
+        governed: env_is_one(EXACTCODE_GOVERNED_SESSION_ENV),
+        explicitly_trusted: env_is_one(EXACTCODE_TRUST_PROJECT_PLUGINS_ENV),
+    }
+}
 
 /// Per-plugin entry stored under the `plugins` map in `config.yaml`, keyed by
 /// the plugin's filesystem path.
@@ -69,16 +92,54 @@ fn discover_enabled_plugins_with_config_and_user_settings(
     config: &Config,
     user_settings: Option<&Path>,
 ) -> Vec<DiscoveredPlugin> {
-    let scoped_settings = load_all_settings(project_root, user_settings);
+    discover_enabled_plugins_with_policy(
+        project_root,
+        config,
+        user_settings,
+        project_plugin_policy(),
+    )
+}
+
+fn discover_enabled_plugins_with_policy(
+    project_root: Option<&Path>,
+    config: &Config,
+    user_settings: Option<&Path>,
+    policy: ProjectPluginPolicy,
+) -> Vec<DiscoveredPlugin> {
+    // Repository settings are untrusted repository state too. When project
+    // plugins are blocked, do not let those settings re-enable an installed
+    // user plugin whose hooks or MCP server can execute code.
+    let trusted_project_root = if policy.allows_project() {
+        project_root
+    } else {
+        None
+    };
+    let scoped_settings = load_all_settings(trusted_project_root, user_settings);
     let mut found: HashMap<String, DiscoveredPlugin> = HashMap::new();
 
     if let Some(root) = project_root {
-        for (name, root) in list_dir_children(&project_plugin_dir(root)) {
-            found.entry(name.clone()).or_insert(DiscoveredPlugin {
-                name,
-                root,
-                scope: PluginScope::Project,
-            });
+        let project_plugins = list_dir_children(&project_plugin_dir(root));
+        if policy.allows_project() {
+            if policy.governed && policy.explicitly_trusted && !project_plugins.is_empty() {
+                tracing::warn!(
+                    trust_environment = EXACTCODE_TRUST_PROJECT_PLUGINS_ENV,
+                    project_plugin_count = project_plugins.len(),
+                    "Operator trust override enabled for project plugins in ExactCode-governed session"
+                );
+            }
+            for (name, root) in project_plugins {
+                found.entry(name.clone()).or_insert(DiscoveredPlugin {
+                    name,
+                    root,
+                    scope: PluginScope::Project,
+                });
+            }
+        } else if !project_plugins.is_empty() {
+            tracing::warn!(
+                trust_environment = EXACTCODE_TRUST_PROJECT_PLUGINS_ENV,
+                project_plugin_count = project_plugins.len(),
+                "Blocked untrusted project plugins in ExactCode-governed session"
+            );
         }
     }
     for (name, root) in list_dir_children(&plugin_install_dir()) {
@@ -95,6 +156,10 @@ fn discover_enabled_plugins_with_config_and_user_settings(
         .collect();
 
     filter_by_config(enabled_by_settings, config)
+}
+
+fn env_is_one(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
 }
 
 /// Apply the `plugins` map in `config.yaml`. Newly discovered plugins are added
@@ -271,10 +336,14 @@ mod tests {
 
     fn discover(project: &Path) -> Vec<DiscoveredPlugin> {
         let cfg_dir = tempfile::tempdir().unwrap();
-        discover_enabled_plugins_with_config_and_user_settings(
+        discover_enabled_plugins_with_policy(
             Some(project),
             &test_config(cfg_dir.path()),
             None,
+            ProjectPluginPolicy {
+                governed: false,
+                explicitly_trusted: false,
+            },
         )
     }
 
@@ -365,7 +434,7 @@ mod tests {
         );
 
         let cfg_dir = tempfile::tempdir().unwrap();
-        let found = discover_enabled_plugins_with_config_and_user_settings(
+        let found = discover_enabled_plugins_with_policy(
             Some(project),
             &test_config(cfg_dir.path()),
             Some(
@@ -375,6 +444,10 @@ mod tests {
                     .join("goose")
                     .join("settings.json"),
             ),
+            ProjectPluginPolicy {
+                governed: false,
+                explicitly_trusted: false,
+            },
         );
 
         assert!(
@@ -393,8 +466,15 @@ mod tests {
         let cfg_dir = tempfile::tempdir().unwrap();
         let config = test_config(cfg_dir.path());
 
-        let found =
-            discover_enabled_plugins_with_config_and_user_settings(Some(project), &config, None);
+        let found = discover_enabled_plugins_with_policy(
+            Some(project),
+            &config,
+            None,
+            ProjectPluginPolicy {
+                governed: false,
+                explicitly_trusted: false,
+            },
+        );
         assert!(found.iter().any(|p| p.name == "demo"));
 
         let entries: HashMap<String, PluginConfigEntry> =
@@ -428,8 +508,15 @@ mod tests {
         let entries = HashMap::from([(key, PluginConfigEntry { enabled: false })]);
         config.set_param(PLUGINS_CONFIG_KEY, entries).unwrap();
 
-        let found =
-            discover_enabled_plugins_with_config_and_user_settings(Some(project), &config, None);
+        let found = discover_enabled_plugins_with_policy(
+            Some(project),
+            &config,
+            None,
+            ProjectPluginPolicy {
+                governed: false,
+                explicitly_trusted: false,
+            },
+        );
         assert!(found.iter().all(|p| p.name != "demo"));
     }
 
@@ -454,12 +541,78 @@ mod tests {
             )
             .unwrap();
 
-        let found =
-            discover_enabled_plugins_with_config_and_user_settings(Some(project), &config, None);
+        let found = discover_enabled_plugins_with_policy(
+            Some(project),
+            &config,
+            None,
+            ProjectPluginPolicy {
+                governed: false,
+                explicitly_trusted: false,
+            },
+        );
         assert!(found.iter().any(|p| p.name == "demo"));
 
         let entries: HashMap<String, PluginConfigEntry> =
             config.get_param(PLUGINS_CONFIG_KEY).unwrap();
         assert!(entries.get(&key).is_some_and(|e| e.enabled));
+    }
+
+    #[test]
+    fn governed_discovery_blocks_project_plugins_and_repo_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        write_plugin_dir(&project.join(".agents/plugins"), "untrusted");
+        write_settings(
+            &project.join(".config/goose"),
+            r#"{"enabledPlugins":["untrusted"]}"#,
+        );
+
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config = test_config(cfg_dir.path());
+        let found = discover_enabled_plugins_with_policy(
+            Some(project),
+            &config,
+            None,
+            ProjectPluginPolicy {
+                governed: true,
+                explicitly_trusted: false,
+            },
+        );
+
+        assert!(found.iter().all(|plugin| plugin.name != "untrusted"));
+        let entries: HashMap<String, PluginConfigEntry> =
+            config.get_param(PLUGINS_CONFIG_KEY).unwrap_or_default();
+        let project_key = project
+            .join(".agents/plugins/untrusted")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            !entries.contains_key(&project_key),
+            "blocked plugin must not be persisted as enabled"
+        );
+    }
+
+    #[test]
+    fn governed_discovery_allows_project_plugins_with_operator_trust() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        write_plugin_dir(&project.join(".agents/plugins"), "trusted");
+
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let found = discover_enabled_plugins_with_policy(
+            Some(project),
+            &test_config(cfg_dir.path()),
+            None,
+            ProjectPluginPolicy {
+                governed: true,
+                explicitly_trusted: true,
+            },
+        );
+
+        let trusted = found
+            .iter()
+            .find(|plugin| plugin.name == "trusted")
+            .expect("operator trust should enable project plugins");
+        assert_eq!(trusted.scope, PluginScope::Project);
     }
 }

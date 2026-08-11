@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject, ListToolsResult,
-    MetaObject, ServerCapabilities, ServerNotification, Tool,
+    MetaObject, ServerCapabilities, ServerNotification, Tool, ToolAnnotations,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -34,6 +34,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub static EXTENSION_NAME: &str = "summon";
+
+const GOVERNED_SESSION_ENV: &str = "EXACTCODE_GOVERNED_SESSION";
 
 const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
@@ -453,6 +455,73 @@ fn max_background_tasks() -> usize {
         .unwrap_or(5)
 }
 
+/// Return the child mode for a delegated task.
+///
+/// Summon cannot currently forward a child's `ActionRequired` messages to its
+/// parent, so children retain the historical Auto-mode behavior. The delegate
+/// tool is explicitly write/destructive annotated, which makes Approve and
+/// SmartApprove ask the parent to authorize the concrete task before this
+/// handler runs. ExactCode's direct `/agent` command applies the same consent
+/// gate in the CLI. Chat is refused here as a final backstop because direct
+/// slash dispatch can otherwise invoke a tool even though Chat disables
+/// model-initiated tools.
+fn delegated_child_mode(governed: bool, parent_mode: GooseMode) -> Result<GooseMode, String> {
+    if !governed || parent_mode != GooseMode::Chat {
+        return Ok(GooseMode::Auto);
+    }
+    Err(
+        "Subagent delegation is unavailable while this ExactCode-governed session is read-only. Use '/permissions ask', 'accept-edit', or 'no-perms' before delegating; ExactCode's capability and allow/deny boundary remain the hard ceiling."
+            .to_string(),
+    )
+}
+
+fn select_delegate_provider_name(
+    governed: bool,
+    requested: Option<String>,
+    recipe: Option<String>,
+    configured: Option<String>,
+    parent: Option<String>,
+) -> Result<String, anyhow::Error> {
+    if governed {
+        for (source, value) in [
+            ("delegate", requested.as_deref()),
+            ("recipe", recipe.as_deref()),
+            ("GOOSE_SUBAGENT_PROVIDER", configured.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| *value != "openai") {
+                anyhow::bail!(
+                    "ExactCode-governed delegation cannot use {source} provider override '{value}'; only the parent 'openai' gateway shim provider is allowed"
+                );
+            }
+        }
+        let parent = parent.ok_or_else(|| {
+            anyhow::anyhow!("ExactCode-governed delegation requires the parent session provider")
+        })?;
+        if parent != "openai" {
+            anyhow::bail!(
+                "ExactCode-governed delegation requires the parent 'openai' gateway shim provider; found '{parent}'"
+            );
+        }
+        return Ok(parent);
+    }
+
+    requested
+        .or(recipe)
+        .or(configured)
+        .or(parent)
+        .ok_or_else(|| anyhow::anyhow!("No provider configured"))
+}
+
+fn reject_legacy_governed_cancel(governed: bool, cancel: bool) -> Result<(), String> {
+    if governed && cancel {
+        return Err(
+            "load(cancel: true) is unavailable in an ExactCode-governed session. Use the destructive-annotated cancel tool so stopping a task follows the approval policy."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn completed_task_ttl() -> Duration {
     let secs = Config::global()
         .get_param::<u64>("GOOSE_COMPLETED_TASK_TTL_SECS")
@@ -589,6 +658,13 @@ impl SummonClient {
                 .to_string(),
             schema.as_object().unwrap().clone(),
         )
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .idempotent(false)
+                .open_world(false),
+        )
     }
 
     fn create_delegate_tool(&self) -> Tool {
@@ -662,6 +738,39 @@ impl SummonClient {
              Decompose → async delegates → load(taskId) for each → synthesize."
                 .to_string(),
             schema.as_object().unwrap().clone(),
+        )
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(true)
+                .idempotent(false)
+                .open_world(false),
+        )
+    }
+
+    fn create_cancel_tool(&self) -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Running background task ID to cancel."
+                }
+            },
+            "required": ["source"],
+            "additionalProperties": false
+        });
+        Tool::new(
+            "cancel",
+            "Cancel one running delegated task by its exact task ID.".to_string(),
+            schema.as_object().unwrap().clone(),
+        )
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(true)
+                .idempotent(false)
+                .open_world(false),
         )
     }
 
@@ -868,6 +977,10 @@ impl SummonClient {
             .and_then(|args| args.get("cancel"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        reject_legacy_governed_cancel(
+            std::env::var(GOVERNED_SESSION_ENV).as_deref() == Ok("1"),
+            cancel,
+        )?;
 
         let peek = arguments
             .as_ref()
@@ -915,6 +1028,30 @@ impl SummonClient {
         self.handle_load_source(session_id, name, &working_dir)
             .await
             .map(CallToolResult::success)
+    }
+
+    async fn handle_cancel(&self, arguments: Option<JsonObject>) -> Result<CallToolResult, String> {
+        let task_id = arguments
+            .as_ref()
+            .and_then(|args| args.get("source"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "cancel requires a background task ID in 'source'".to_string())?;
+        if !is_session_id(task_id) {
+            return Err("cancel source must be an exact background task ID".to_string());
+        }
+        let result = self.handle_load_task_result(task_id, true, false).await?;
+        let mut meta = MetaObject::new();
+        meta.0.insert(
+            "subagent_session_id".to_string(),
+            serde_json::Value::String(task_id.to_string()),
+        );
+        meta.0.insert(
+            "task_status".to_string(),
+            serde_json::Value::String(result.status.to_string()),
+        );
+        Ok(CallToolResult::success(result.content).with_meta(Some(meta)))
     }
 
     async fn handle_load_task_result(
@@ -1139,9 +1276,10 @@ impl SummonClient {
         }
 
         let sources = self.get_sources(session_id, working_dir).await;
+        let running = self.background_tasks.lock().await;
         let completed = self.completed_tasks.lock().await;
 
-        if sources.is_empty() && completed.is_empty() {
+        if sources.is_empty() && running.is_empty() && completed.is_empty() {
             return Ok(vec![ContentBlock::text(
                 "No sources available for load/delegate.\n\n\
                  Sources are discovered from:\n\
@@ -1153,6 +1291,27 @@ impl SummonClient {
         }
 
         let mut output = String::from("Available sources for load/delegate:\n");
+
+        if !running.is_empty() {
+            output.push_str("\nRunning Tasks:\n");
+            let now = current_epoch_millis();
+            let mut sorted_running: Vec<_> = running.values().collect();
+            sorted_running.sort_by_key(|task| &task.id);
+            for task in sorted_running {
+                let idle_ms = now.saturating_sub(task.last_activity.load(Ordering::Relaxed));
+                output.push_str(&format!(
+                    "• {} - \"{}\" (running {} · {} turns · idle {})\n",
+                    task.id,
+                    task.description,
+                    round_duration(task.started_at.elapsed()),
+                    task.turns.load(Ordering::Relaxed),
+                    round_duration(Duration::from_millis(idle_ms)),
+                ));
+            }
+            output.push_str(
+                "Use load(source: \"<task-id>\", peek: true) for status or cancel(source: \"<task-id>\") to stop.\n",
+            );
+        }
 
         if !completed.is_empty() {
             output.push_str("\nCompleted Tasks (awaiting retrieval):\n");
@@ -1268,8 +1427,15 @@ impl SummonClient {
             return Err("Delegated tasks cannot spawn further delegations".to_string());
         }
 
+        let child_mode = delegated_child_mode(
+            std::env::var(GOVERNED_SESSION_ENV).as_deref() == Ok("1"),
+            session.goose_mode,
+        )?;
+
         if params.r#async {
-            let (content, task_id) = self.handle_async_delegate(session_id, params).await?;
+            let (content, task_id) = self
+                .handle_async_delegate(session_id, params, child_mode)
+                .await?;
             let mut meta = MetaObject::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
@@ -1288,14 +1454,14 @@ impl SummonClient {
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
+        // The parent has already authorized the concrete destructive-annotated
+        // delegate call (or explicitly selected Auto). Child ActionRequired
+        // forwarding is not available, so the child itself remains Auto.
         let agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),
             None,
-            GooseMode::Auto,
+            child_mode,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
         )
@@ -1686,22 +1852,18 @@ impl SummonClient {
         ),
         anyhow::Error,
     > {
-        let provider_name = params
-            .provider
-            .clone()
-            .or_else(|| {
-                recipe
-                    .settings
-                    .as_ref()
-                    .and_then(|s| s.goose_provider.clone())
-            })
-            .or_else(|| {
-                Config::global()
-                    .get_param::<String>("GOOSE_SUBAGENT_PROVIDER")
-                    .ok()
-            })
-            .or_else(|| session.provider_name.clone())
-            .ok_or_else(|| anyhow::anyhow!("No provider configured"))?;
+        let provider_name = select_delegate_provider_name(
+            std::env::var(GOVERNED_SESSION_ENV).as_deref() == Ok("1"),
+            params.provider.clone(),
+            recipe
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.goose_provider.clone()),
+            Config::global()
+                .get_param::<String>("GOOSE_SUBAGENT_PROVIDER")
+                .ok(),
+            session.provider_name.clone(),
+        )?;
 
         let model_config = self.resolve_model_config(params, recipe, session, &provider_name)?;
         let provider = match providers::get_from_registry(&provider_name).await {
@@ -1815,6 +1977,7 @@ impl SummonClient {
         &self,
         session_id: &str,
         params: DelegateParams,
+        child_mode: GooseMode,
     ) -> Result<(Vec<ContentBlock>, String), String> {
         let task_count = self.background_tasks.lock().await.len();
         let max_tasks = max_background_tasks();
@@ -1844,14 +2007,13 @@ impl SummonClient {
 
         let description = safe_truncate(&Self::get_task_description(&params), TASK_LABEL_BUDGET);
 
-        // Subagents must use Auto until get_agent_messages forwards
-        // ActionRequired messages to the parent. Until then, any mode
-        // that requires approval will hang on the subagent's confirmation_rx.
+        // The parent has already authorized the concrete destructive-annotated
+        // delegate call (or explicitly selected Auto). See the sync path.
         let agent_config = AgentConfig::new(
             self.context.session_manager.clone(),
             crate::config::permission::PermissionManager::instance(),
             None,
-            GooseMode::Auto,
+            child_mode,
             true, // disable session naming for subagents
             crate::agents::GoosePlatform::GooseCli,
         )
@@ -1947,6 +2109,7 @@ impl McpClientTrait for SummonClient {
 
         if !is_subagent {
             tools.push(self.create_delegate_tool());
+            tools.push(self.create_cancel_tool());
         }
 
         Ok(ListToolsResult {
@@ -1985,6 +2148,13 @@ impl McpClientTrait for SummonClient {
                     ))])),
                 }
             }
+            "cancel" => match self.handle_cancel(arguments).await {
+                Ok(result) => Ok(result),
+                Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Error: {}",
+                    error
+                ))])),
+            },
             _ => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error: Unknown tool: {}",
                 name
@@ -2117,6 +2287,156 @@ mod tests {
             session: None,
             use_login_shell_path: false,
         }
+    }
+
+    #[test]
+    fn governed_child_mode_requires_outer_consent_and_rejects_read_only() {
+        for mode in [GooseMode::Approve, GooseMode::SmartApprove, GooseMode::Auto] {
+            assert_eq!(delegated_child_mode(true, mode).unwrap(), GooseMode::Auto);
+        }
+
+        let error = delegated_child_mode(true, GooseMode::Chat).unwrap_err();
+        assert!(error.contains("read-only"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn delegate_tool_is_always_classified_as_mutating_and_destructive() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let load_tool = client.create_load_tool();
+        let load_annotations = load_tool.annotations.as_ref().expect("load annotations");
+        assert_eq!(load_annotations.read_only_hint, Some(true));
+        assert_eq!(load_annotations.destructive_hint, Some(false));
+
+        let delegate_tool = client.create_delegate_tool();
+        let delegate_annotations = delegate_tool
+            .annotations
+            .as_ref()
+            .expect("delegate annotations");
+        assert_eq!(delegate_annotations.read_only_hint, Some(false));
+        assert_eq!(delegate_annotations.destructive_hint, Some(true));
+        assert_eq!(delegate_annotations.idempotent_hint, Some(false));
+        assert_eq!(delegate_annotations.open_world_hint, Some(false));
+
+        let cancel_tool = client.create_cancel_tool();
+        let cancel_annotations = cancel_tool
+            .annotations
+            .as_ref()
+            .expect("cancel annotations");
+        assert_eq!(cancel_annotations.read_only_hint, Some(false));
+        assert_eq!(cancel_annotations.destructive_hint, Some(true));
+
+        let temp_dir = TempDir::new().unwrap();
+        let permissions =
+            crate::config::permission::PermissionManager::new(temp_dir.path().join("permissions"));
+        permissions.update_smart_approve_permission(
+            "delegate",
+            crate::config::permission::PermissionLevel::AlwaysAllow,
+        );
+        permissions.apply_tool_annotations(&[load_tool, delegate_tool, cancel_tool]);
+        assert_eq!(permissions.get_smart_approve_permission("load"), None);
+        assert_eq!(
+            permissions.get_smart_approve_permission("delegate"),
+            Some(crate::config::permission::PermissionLevel::AskBefore)
+        );
+        assert_eq!(
+            permissions.get_smart_approve_permission("cancel"),
+            Some(crate::config::permission::PermissionLevel::AskBefore)
+        );
+    }
+
+    #[test]
+    fn standalone_child_mode_preserves_existing_auto_behavior() {
+        for mode in [
+            GooseMode::Approve,
+            GooseMode::SmartApprove,
+            GooseMode::Chat,
+            GooseMode::Auto,
+        ] {
+            assert_eq!(delegated_child_mode(false, mode).unwrap(), GooseMode::Auto);
+        }
+    }
+
+    #[test]
+    fn governed_delegate_inherits_gateway_provider_and_rejects_direct_overrides() {
+        assert_eq!(
+            select_delegate_provider_name(
+                true,
+                Some("openai".to_string()),
+                None,
+                None,
+                Some("openai".to_string()),
+            )
+            .unwrap(),
+            "openai"
+        );
+
+        for (requested, recipe, configured, expected) in [
+            (Some("anthropic"), None, None, "delegate provider override"),
+            (None, Some("openrouter"), None, "recipe provider override"),
+            (
+                None,
+                None,
+                Some("google"),
+                "GOOSE_SUBAGENT_PROVIDER provider override",
+            ),
+        ] {
+            let error = select_delegate_provider_name(
+                true,
+                requested.map(str::to_string),
+                recipe.map(str::to_string),
+                configured.map(str::to_string),
+                Some("openai".to_string()),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
+
+        let error =
+            select_delegate_provider_name(true, None, None, None, Some("anthropic".to_string()))
+                .unwrap_err();
+        assert!(error.to_string().contains("gateway shim provider"));
+        assert!(select_delegate_provider_name(true, None, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("parent session provider"));
+    }
+
+    #[test]
+    fn standalone_delegate_keeps_provider_override_precedence() {
+        assert_eq!(
+            select_delegate_provider_name(
+                false,
+                Some("requested".to_string()),
+                Some("recipe".to_string()),
+                Some("configured".to_string()),
+                Some("parent".to_string()),
+            )
+            .unwrap(),
+            "requested"
+        );
+        assert_eq!(
+            select_delegate_provider_name(
+                false,
+                None,
+                Some("recipe".to_string()),
+                Some("configured".to_string()),
+                Some("parent".to_string()),
+            )
+            .unwrap(),
+            "recipe"
+        );
+    }
+
+    #[test]
+    fn governed_legacy_load_cannot_hide_destructive_cancellation() {
+        assert!(reject_legacy_governed_cancel(true, false).is_ok());
+        assert!(reject_legacy_governed_cancel(false, true).is_ok());
+        assert!(reject_legacy_governed_cancel(true, true)
+            .unwrap_err()
+            .contains("destructive-annotated cancel tool"));
     }
 
     #[test]
@@ -3097,6 +3417,18 @@ You review code."#;
             .lock()
             .await
             .contains_key("20260204_1"));
+
+        let workspace = TempDir::new().unwrap();
+        let discovery = client
+            .handle_load_discovery("test", workspace.path())
+            .await
+            .unwrap();
+        let discovery_text = extract_text(&discovery[0]);
+        assert!(discovery_text.contains("Running Tasks:"));
+        assert!(discovery_text.contains("20260204_1"));
+        assert!(discovery_text.contains("Long running analysis"));
+        assert!(discovery_text.contains("7 turns"));
+        assert!(discovery_text.contains("cancel(source:"));
     }
 
     #[tokio::test]

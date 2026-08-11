@@ -200,6 +200,9 @@ async fn list_provider_entries(current_provider: Option<&str>) -> Vec<ProviderOp
 pub(super) async fn build_provider_options(
     current_provider: Option<&str>,
 ) -> Vec<SessionConfigSelectOption> {
+    if std::env::var("EXACTCODE_GOVERNED_SESSION").as_deref() == Ok("1") {
+        return vec![SessionConfigSelectOption::new("openai", "openai")];
+    }
     list_provider_entries(current_provider)
         .await
         .into_iter()
@@ -222,6 +225,12 @@ pub(super) fn build_mode_state(
             agent_client_protocol::Error::internal_error() // impossible but satisfy linters
                 .data(format!("Failed to parse GooseMode variant: {}", name))
         })?;
+        if goose_mode == GooseMode::Auto
+            && std::env::var("EXACTCODE_GOVERNED_SESSION").as_deref() == Ok("1")
+            && std::env::var("EXACTCODE_CAPABILITY_MODE").as_deref() != Ok("read_only")
+        {
+            continue;
+        }
         let mut mode = SessionMode::new(SessionModeId::new(name), name);
         mode.description = goose_mode.get_message().map(Into::into);
         available.push(mode);
@@ -330,6 +339,7 @@ fn thinking_effort_values(model_config: &ModelConfig) -> &'static [ThinkingEffor
             ThinkingEffort::Low,
             ThinkingEffort::Medium,
             ThinkingEffort::High,
+            ThinkingEffort::XHigh,
             ThinkingEffort::Max,
         ]
     } else {

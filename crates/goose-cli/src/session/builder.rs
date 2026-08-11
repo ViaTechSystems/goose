@@ -3,7 +3,7 @@ use crate::cli::StreamableHttpOptions;
 use super::output;
 use super::CliSession;
 use console::style;
-use goose::agents::{Agent, Container, ExtensionError};
+use goose::agents::{configured_additional_system_prompt, Agent, Container, ExtensionError};
 use goose::config::resolve_extensions_for_new_session;
 use goose::config::{Config, ExtensionConfig, GooseMode};
 use goose::model_config::model_config_from_user_config;
@@ -525,6 +525,18 @@ async fn configure_session_prompts(
         session
             .agent
             .extend_system_prompt("additional".to_string(), additional_prompt.clone())
+            .await;
+    }
+
+    let configured_additional_prompt =
+        configured_additional_system_prompt(config).unwrap_or_else(|error| {
+            output::render_error(&format!("Failed to load additional system prompt: {error}"));
+            process::exit(1);
+        });
+    if let Some(prompt) = configured_additional_prompt {
+        session
+            .agent
+            .extend_system_prompt("configured-additional".to_string(), prompt)
             .await;
     }
 
