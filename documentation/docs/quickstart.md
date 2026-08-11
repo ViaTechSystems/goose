@@ -30,6 +30,15 @@ Let's begin 🚀
 
 ## Install goose
 
+:::note ViaTech fork release status
+The CLI tabs below use the ViaTech checksum-backed `stable` installer. If the
+[ViaTech releases page](https://github.com/ViaTechSystems/goose/releases) does
+not show `stable` yet, use the Cargo source fallback in the
+[installation guide](/docs/getting-started/installation). Desktop downloads
+remain upstream builds and do not include the ViaTech session controls. The
+ViaTech CLI does not update itself automatically.
+:::
+
 <Tabs>
   <TabItem value="mac" label="macOS" default>
     Choose to install the Desktop and/or CLI version of goose:
@@ -43,10 +52,10 @@ Let's begin 🚀
         </div>
       </TabItem>
       <TabItem value="cli" label="goose CLI">
-        Run the following command to install goose:
+        Run the following command to install the ViaTech CLI:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
         ```
       </TabItem>
     </Tabs>
@@ -68,10 +77,10 @@ Let's begin 🚀
         </div>
       </TabItem>
       <TabItem value="cli" label="goose CLI">
-        Run the following command to install the goose CLI on Linux:
+        Run the following command to install the ViaTech CLI on Linux:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
         ```   
       </TabItem>
     </Tabs>
@@ -90,11 +99,15 @@ Let's begin 🚀
       </TabItem>
       <TabItem value="cli" label="goose CLI">
         
-        Run the following command in **Git Bash**, **MSYS2**, or **PowerShell** to install the goose CLI natively on Windows:
+        Run the following command in **Git Bash** or **MSYS2** to install the
+        ViaTech CLI natively on Windows:
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
         ```
+
+        Native PowerShell users should use the Cargo fallback in the
+        installation guide until a checksum-backed PowerShell installer ships.
         
         Learn about prerequisites in the [installation guide](/docs/getting-started/installation).
 

@@ -7,6 +7,7 @@ use goose::conversation::message::{
     ToolNameParts, ToolRequest, ToolResponse,
 };
 use goose::providers::canonical::maybe_get_canonical_model;
+use goose::session::Session;
 #[cfg(target_os = "windows")]
 use goose::subprocess::SubprocessExt;
 use goose::utils::safe_truncate;
@@ -265,7 +266,7 @@ pub fn render_message(message: &Message, debug: bool) {
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
             MessageContent::ToolResponse(resp) => render_tool_response(resp, debug),
             MessageContent::Image(image) => {
-                println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+                println!("{}", image_attachment_label(&image.mime_type));
             }
             MessageContent::Thinking(t) => render_thinking(&t.thinking, theme),
             MessageContent::RedactedThinking(_) => {
@@ -359,7 +360,7 @@ pub fn render_message_streaming(
             }
             MessageContent::Image(image) => {
                 flush_markdown_buffer(buffer, theme);
-                println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+                println!("{}", image_attachment_label(&image.mime_type));
             }
             MessageContent::Thinking(t) => {
                 render_thinking_streaming(&t.thinking, buffer, thinking_header_shown, theme);
@@ -404,6 +405,10 @@ pub fn render_message_streaming(
         render_output_token_limit_warning();
     }
     let _ = std::io::stdout().flush();
+}
+
+fn image_attachment_label(mime_type: &str) -> String {
+    format!("[image attachment · {mime_type}]")
 }
 
 fn reached_output_token_limit(message: &Message) -> bool {
@@ -497,6 +502,43 @@ pub fn render_exit_plan_mode() {
 
 pub fn goose_mode_message(text: &str) {
     println!("\n{} {}", accent("mode:"), text);
+}
+
+pub fn session_message(text: &str) {
+    println!("\n{} {}", accent("session:"), text);
+}
+
+pub fn render_sessions(sessions: &[Session], current_session_id: &str) {
+    if sessions.is_empty() {
+        session_message("No saved sessions found");
+        return;
+    }
+
+    println!("\n{}", accent("saved sessions:").bold());
+    for session in sessions {
+        let marker = if session.id == current_session_id {
+            success("●")
+        } else {
+            style("○").dim()
+        };
+        let id: String = session.id.chars().take(8).collect();
+        let name = safe_truncate(&session.name, 36);
+        println!(
+            "  {} {:8}  {:36}  {} messages  {}  {}",
+            marker,
+            style(id).dim(),
+            name,
+            session.message_count,
+            session.updated_at.format("%Y-%m-%d %H:%M"),
+            style(session.working_dir.display()).dim(),
+        );
+    }
+    println!("\n  {}", style("● current · /resume <name-or-id>").dim());
+}
+
+pub fn render_worktree_diff(diff: &str) {
+    println!("\n{}", accent("working-tree diff:").bold());
+    print_markdown(&format!("```diff\n{}\n```", diff.trim_end()), get_theme());
 }
 
 fn should_show_thinking() -> bool {
@@ -1611,6 +1653,13 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+
+    #[test]
+    fn image_attachment_label_never_renders_base64_payloads() {
+        let label = image_attachment_label("image/webp");
+        assert_eq!(label, "[image attachment · image/webp]");
+        assert!(!label.contains("base64"));
+    }
 
     #[test]
     fn recent_lines_accumulate_across_updates() {

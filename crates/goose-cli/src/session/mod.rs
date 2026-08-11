@@ -2,7 +2,9 @@ mod builder;
 mod completion;
 pub mod editor;
 mod elicitation;
+mod images;
 mod input;
+mod live_input;
 mod output;
 mod paste;
 pub mod streaming_buffer;
@@ -42,7 +44,7 @@ use goose::config::extensions::name_to_key;
 use goose::config::{Config, GooseMode};
 use input::InputResult;
 use rmcp::model::ServerNotification;
-use rmcp::model::{ElicitationAction, PromptMessage};
+use rmcp::model::{CallToolRequestParams, ElicitationAction, JsonObject, PromptMessage};
 use rmcp::model::{ErrorCode, ErrorData};
 use strum::VariantNames;
 
@@ -50,13 +52,15 @@ use goose::config::paths::Paths;
 use goose::config::providers;
 use goose::conversation::message::{ActionRequiredData, Message, MessageContent};
 use goose::providers::inventory::ProviderInventoryService;
-use goose::session::SessionManager;
+use goose::session::{Session, SessionManager, SessionType};
+use goose_providers::thinking::ThinkingEffort;
 use rustyline::EditMode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio;
@@ -67,6 +71,249 @@ const GOOSE_PLANNER_CONTEXT_LIMIT: &str = "GOOSE_PLANNER_CONTEXT_LIMIT";
 const SHELL_STATUS_FALLBACK_WIDTH: usize = 120;
 const SHELL_STATUS_MAX_LINES: usize = 3;
 const SHELL_STATUS_RESERVED_WIDTH: usize = 2;
+const REVIEW_DIFF_LIMIT: usize = 180_000;
+const GOVERNED_SESSION_ENV: &str = "EXACTCODE_GOVERNED_SESSION";
+const GOVERNED_WORKSPACE_ENV: &str = "EXACTCODE_WORKSPACE_ROOT";
+#[cfg(not(target_os = "windows"))]
+const NULL_DEVICE: &str = "/dev/null";
+#[cfg(target_os = "windows")]
+const NULL_DEVICE: &str = "NUL";
+
+const THINKING_EFFORTS: [ThinkingEffort; 5] = [
+    ThinkingEffort::Off,
+    ThinkingEffort::Low,
+    ThinkingEffort::Medium,
+    ThinkingEffort::High,
+    ThinkingEffort::Max,
+];
+
+fn next_thinking_effort(current: ThinkingEffort) -> ThinkingEffort {
+    let index = THINKING_EFFORTS
+        .iter()
+        .position(|effort| *effort == current)
+        .unwrap_or(0);
+    THINKING_EFFORTS[(index + 1) % THINKING_EFFORTS.len()]
+}
+
+fn permission_mode(policy: &str) -> Option<GooseMode> {
+    match policy {
+        "ask" => Some(GooseMode::Approve),
+        "accept-edit" => Some(GooseMode::SmartApprove),
+        "no-perms" => Some(GooseMode::Auto),
+        "read-only" => Some(GooseMode::Chat),
+        _ => None,
+    }
+}
+
+fn permission_policy_name(mode: GooseMode) -> &'static str {
+    match mode {
+        GooseMode::Approve => "ask",
+        GooseMode::SmartApprove => "accept-edit",
+        GooseMode::Auto => "no-perms",
+        GooseMode::Chat => "read-only",
+    }
+}
+
+fn slash_tool_matches(registered_name: &str, tool_name: &str) -> bool {
+    registered_name == tool_name || registered_name.ends_with(&format!("__{tool_name}"))
+}
+
+fn valid_process_id(process_id: &str) -> bool {
+    !process_id.is_empty()
+        && process_id.split_whitespace().count() == 1
+        && process_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    if path == "~" {
+        return etcetera::home_dir().unwrap_or_else(|_| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = etcetera::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn resolve_working_directory(
+    requested: Option<&str>,
+    current: &std::path::Path,
+    previous: Option<&std::path::Path>,
+) -> Result<PathBuf> {
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    let candidate = match requested {
+        None => etcetera::home_dir().context("Could not determine the home directory")?,
+        Some("-") => previous
+            .map(PathBuf::from)
+            .context("No previous working directory in this session")?,
+        Some(value) => {
+            let path = expand_home(value);
+            if path.is_absolute() {
+                path
+            } else {
+                current.join(path)
+            }
+        }
+    };
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("Directory does not exist: {}", candidate.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("Not a directory: {}", canonical.display());
+    }
+    Ok(canonical)
+}
+
+fn governed_workspace_root() -> Result<Option<PathBuf>> {
+    if std::env::var(GOVERNED_SESSION_ENV).as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    let configured = std::env::var(GOVERNED_WORKSPACE_ENV)
+        .with_context(|| format!("{GOVERNED_WORKSPACE_ENV} is required in governed mode"))?;
+    let root = PathBuf::from(configured)
+        .canonicalize()
+        .context("The governed workspace root does not exist")?;
+    anyhow::ensure!(
+        root.is_dir(),
+        "The governed workspace root is not a directory"
+    );
+    Ok(Some(root))
+}
+
+fn enforce_governed_workspace(path: &std::path::Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("Directory does not exist: {}", path.display()))?;
+    if let Some(root) = governed_workspace_root()? {
+        anyhow::ensure!(
+            canonical.starts_with(&root),
+            "Governed sessions cannot leave the authorized workspace: {}",
+            root.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn governed_builtin_is_blocked(names: &str) -> bool {
+    std::env::var(GOVERNED_SESSION_ENV).as_deref() == Ok("1")
+        && names
+            .split(',')
+            .map(str::trim)
+            .any(|name| name.eq_ignore_ascii_case("developer"))
+}
+
+fn resolve_session_selector<'a>(sessions: &'a [Session], selector: &str) -> Result<&'a Session> {
+    let selector = selector.trim();
+    anyhow::ensure!(!selector.is_empty(), "Session name or ID is required");
+
+    if let Some(session) = sessions.iter().find(|session| session.id == selector) {
+        return Ok(session);
+    }
+
+    let name_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.name == selector)
+        .collect();
+    match name_matches.as_slice() {
+        [session] => return Ok(*session),
+        [] => {}
+        _ => anyhow::bail!(
+            "More than one saved session is named '{selector}'; use a session ID instead"
+        ),
+    }
+
+    let prefix_matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.id.starts_with(selector))
+        .collect();
+    match prefix_matches.as_slice() {
+        [session] => Ok(*session),
+        [] => anyhow::bail!("No saved session matches '{selector}'"),
+        _ => anyhow::bail!("Session ID prefix '{selector}' is ambiguous"),
+    }
+}
+
+fn run_git(repo: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to run git {}", args.join(" ")))
+}
+
+fn successful_git(repo: &std::path::Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = run_git(repo, args)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+fn collect_worktree_diff(working_dir: &std::path::Path) -> Result<String> {
+    let root_output = successful_git(working_dir, &["rev-parse", "--show-toplevel"])
+        .context("The active working directory is not inside a Git repository")?;
+    let root = PathBuf::from(String::from_utf8_lossy(&root_output).trim());
+
+    let has_head = run_git(&root, &["rev-parse", "--verify", "HEAD"])
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    let mut diff = if has_head {
+        successful_git(&root, &["diff", "--no-ext-diff", "--binary", "HEAD", "--"])?
+    } else {
+        let mut combined = successful_git(
+            &root,
+            &["diff", "--no-ext-diff", "--binary", "--cached", "--"],
+        )?;
+        combined.extend(successful_git(
+            &root,
+            &["diff", "--no-ext-diff", "--binary", "--"],
+        )?);
+        combined
+    };
+
+    let untracked = successful_git(&root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for raw_path in untracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = String::from_utf8_lossy(raw_path);
+        let output = run_git(
+            &root,
+            &["diff", "--no-index", "--binary", "--", NULL_DEVICE, &path],
+        )?;
+        anyhow::ensure!(
+            matches!(output.status.code(), Some(0 | 1)),
+            "git diff for untracked file '{}' failed: {}",
+            path,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        diff.extend(output.stdout);
+    }
+
+    Ok(String::from_utf8_lossy(&diff).into_owned())
+}
+
+fn bounded_review_diff(diff: &str) -> (String, bool) {
+    if diff.len() <= REVIEW_DIFF_LIMIT {
+        return (diff.to_string(), false);
+    }
+    let mut end = REVIEW_DIFF_LIMIT;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    (diff.get(..end).unwrap_or_default().to_string(), true)
+}
+
+fn short_session_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
 
 fn planner_provider_messages(plan_messages: &Conversation) -> Conversation {
     // The planner prompt has no turn-context instructions; drop the blocks.
@@ -210,6 +457,10 @@ pub struct CliSession {
     retry_config: Option<RetryConfig>,
     output_format: String,
     stats: bool,
+    previous_working_dir: Option<PathBuf>,
+    queued_followups: VecDeque<String>,
+    stream_input_prefill: Option<String>,
+    pending_images: Vec<images::PendingImage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +476,9 @@ pub struct CompletionCache {
     pub prompt_info: HashMap<String, output::PromptInfo>,
     pub provider_names: Vec<String>,
     pub provider_models: HashMap<String, Vec<String>>,
+    pub session_selectors: Vec<String>,
     pub current_session_provider: String,
+    pub current_thinking_effort: ThinkingEffort,
     pub last_updated: Instant,
     pub hint_status: HintStatus,
 }
@@ -237,7 +490,9 @@ impl CompletionCache {
             prompt_info: HashMap::new(),
             provider_names: Vec::new(),
             provider_models: HashMap::new(),
+            session_selectors: Vec::new(),
             current_session_provider: String::new(),
+            current_thinking_effort: ThinkingEffort::Off,
             last_updated: Instant::now(),
             hint_status: HintStatus::Default,
         }
@@ -327,6 +582,10 @@ impl CliSession {
             retry_config,
             output_format,
             stats,
+            previous_working_dir: None,
+            queued_followups: VecDeque::new(),
+            stream_input_prefill: None,
+            pending_images: Vec::new(),
         }
     }
 
@@ -564,10 +823,9 @@ impl CliSession {
         let mut editor = self.create_editor()?;
         let history_manager = HistoryManager::new();
         history_manager.load(&mut editor);
+        let mut pending_input: Option<String> = None;
 
         loop {
-            self.display_context_usage().await?;
-
             let conversation_strings: Vec<String> = self
                 .messages
                 .user_visible_messages()
@@ -580,11 +838,36 @@ impl CliSession {
                     format!("## {}: {}", role, msg.as_concat_text())
                 })
                 .collect();
+            if let Some(followup) = self.queued_followups.pop_front() {
+                output::session_message("Running queued follow-up");
+                editor.add_history_entry(&followup)?;
+                let input = input::parse_submitted_input(&followup);
+                if matches!(input, InputResult::Exit) {
+                    break;
+                }
+                self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
+                    .await?;
+                continue;
+            }
+            self.display_context_usage().await?;
 
             output::run_status_hook("waiting");
-            let input = input::get_input(&mut editor, Some(&conversation_strings))?;
+            if pending_input.is_none() {
+                pending_input = self.stream_input_prefill.take();
+            }
+            let input = input::get_input(
+                &mut editor,
+                Some(&conversation_strings),
+                pending_input.as_deref(),
+            )?;
+            pending_input = None;
             if matches!(input, InputResult::Exit) {
                 break;
+            }
+            if let InputResult::CycleThinking(buffer) = input {
+                self.handle_cycle_thinking().await?;
+                pending_input = Some(buffer);
+                continue;
             }
             self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
                 .await?;
@@ -626,16 +909,28 @@ impl CliSession {
             InputResult::Exit => unreachable!("Exit is handled in the main loop"),
             InputResult::AddExtension(cmd) => {
                 history.save(editor);
-                match self.add_extension(cmd.clone()).await {
-                    Ok(_) => output::render_extension_success(&cmd),
-                    Err(e) => output::render_extension_error(&cmd, &e.to_string()),
+                if governed_workspace_root()?.is_some() {
+                    output::render_error(
+                        "Dynamic stdio extensions are disabled in this ExactCode-governed session.",
+                    );
+                } else {
+                    match self.add_extension(cmd.clone()).await {
+                        Ok(_) => output::render_extension_success(&cmd),
+                        Err(e) => output::render_extension_error(&cmd, &e.to_string()),
+                    }
                 }
             }
             InputResult::AddBuiltin(names) => {
                 history.save(editor);
-                match self.add_builtin(names.clone()).await {
-                    Ok(_) => output::render_builtin_success(&names),
-                    Err(e) => output::render_builtin_error(&names, &e.to_string()),
+                if governed_builtin_is_blocked(&names) {
+                    output::render_error(
+                        "The raw developer extension is disabled in this ExactCode-governed session.",
+                    );
+                } else {
+                    match self.add_builtin(names.clone()).await {
+                        Ok(_) => output::render_builtin_success(&names),
+                        Err(e) => output::render_builtin_error(&names, &e.to_string()),
+                    }
                 }
             }
             InputResult::ToggleTheme => {
@@ -662,9 +957,82 @@ impl CliSession {
                 history.save(editor);
                 self.handle_goose_mode(&mode).await?;
             }
+            InputResult::Permissions(policy) => {
+                history.save(editor);
+                self.handle_permissions(policy.as_deref()).await?;
+            }
             InputResult::Model(options) => {
                 history.save(editor);
                 self.handle_model(options).await?;
+            }
+            InputResult::Thinking(effort) => {
+                history.save(editor);
+                self.handle_thinking(effort.as_deref()).await?;
+            }
+            InputResult::AttachImages(paths) => {
+                history.save(editor);
+                self.handle_attach_images(&paths).await?;
+            }
+            InputResult::Images(action) => {
+                history.save(editor);
+                self.handle_images(action.as_deref());
+            }
+            InputResult::CycleThinking(_) => {
+                unreachable!("Shift+Tab is handled before normal input dispatch")
+            }
+            InputResult::ChangeDirectory(directory) => {
+                history.save(editor);
+                self.handle_change_directory(directory.as_deref()).await?;
+            }
+            InputResult::PrintWorkingDirectory => {
+                self.handle_print_working_directory().await?;
+            }
+            InputResult::NewSession(name) => {
+                history.save(editor);
+                self.handle_new_session(name.as_deref()).await?;
+            }
+            InputResult::ResumeSession(selector) => {
+                history.save(editor);
+                self.handle_resume_session(selector.as_deref()).await?;
+            }
+            InputResult::ForkSession(name) => {
+                history.save(editor);
+                self.handle_fork_session(name.as_deref()).await?;
+            }
+            InputResult::RenameSession(name) => {
+                history.save(editor);
+                self.handle_rename_session(&name).await?;
+            }
+            InputResult::ListSessions => {
+                self.handle_list_sessions().await?;
+            }
+            InputResult::Diff => {
+                self.handle_diff().await?;
+            }
+            InputResult::Review(instructions) => {
+                history.save(editor);
+                self.handle_review(instructions.as_deref(), history, editor)
+                    .await?;
+            }
+            InputResult::Queue(message) => {
+                history.save(editor);
+                self.handle_queue(message.as_deref()).await;
+            }
+            InputResult::ProcessList => {
+                history.save(editor);
+                self.handle_process_list().await?;
+            }
+            InputResult::StopProcess(process) => {
+                history.save(editor);
+                self.handle_stop_process(&process).await?;
+            }
+            InputResult::Subagents => {
+                history.save(editor);
+                self.handle_subagents().await?;
+            }
+            InputResult::Agent(instructions) => {
+                history.save(editor);
+                self.handle_agent(instructions.as_deref()).await?;
             }
             InputResult::Plan(options) => {
                 self.handle_plan_mode(options).await?;
@@ -738,10 +1106,11 @@ impl CliSession {
         history: &HistoryManager,
         editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     ) -> Result<()> {
+        let message = images::message_with_images(content, &mut self.pending_images);
         match self.run_mode {
             RunMode::Normal => {
                 history.save(editor);
-                self.push_message(Message::user().with_text(content));
+                self.push_message(message);
 
                 let _provider = self.agent.provider().await?;
 
@@ -759,13 +1128,76 @@ impl CliSession {
             }
             RunMode::Plan => {
                 let mut plan_messages = self.messages.clone();
-                plan_messages.push(Message::user().with_text(content));
+                plan_messages.push(message);
                 let (reasoner, reasoner_model_config) = get_reasoner().await?;
                 self.plan_with_reasoner_model(plan_messages, reasoner, reasoner_model_config)
                     .await?;
             }
         }
         Ok(())
+    }
+
+    async fn handle_attach_images(&mut self, paths: &[String]) -> Result<()> {
+        let working_dir = self.current_session_working_directory().await?;
+        let governed_root = governed_workspace_root()?;
+        match images::load_images(
+            paths,
+            &working_dir,
+            governed_root.as_deref(),
+            &self.pending_images,
+        ) {
+            Ok(loaded) => {
+                let added = loaded.len();
+                self.pending_images.extend(loaded);
+                let bytes: usize = self.pending_images.iter().map(|image| image.byte_len).sum();
+                output::session_message(&format!(
+                    "Attached {added} image(s) for the next message · {}/{} · {} total",
+                    self.pending_images.len(),
+                    images::MAX_IMAGE_ATTACHMENTS,
+                    images::format_bytes(bytes)
+                ));
+                for image in self.pending_images.iter().rev().take(added).rev() {
+                    println!(
+                        "  {} · {} · {}",
+                        image.path.display(),
+                        image.mime_type,
+                        images::format_bytes(image.byte_len)
+                    );
+                }
+            }
+            Err(error) => output::render_error(&error.to_string()),
+        }
+        Ok(())
+    }
+
+    fn handle_images(&mut self, action: Option<&str>) {
+        match action.map(str::trim).filter(|value| !value.is_empty()) {
+            Some("clear") => {
+                let removed = self.pending_images.len();
+                self.pending_images.clear();
+                output::session_message(&format!("Cleared {removed} pending image(s)"));
+            }
+            Some(_) => output::render_error("Usage: /images [clear]"),
+            None if self.pending_images.is_empty() => {
+                output::session_message("No images are attached to the next message");
+            }
+            None => {
+                let bytes: usize = self.pending_images.iter().map(|image| image.byte_len).sum();
+                output::session_message(&format!(
+                    "{} image(s) attached for the next message · {} total",
+                    self.pending_images.len(),
+                    images::format_bytes(bytes)
+                ));
+                for image in &self.pending_images {
+                    println!(
+                        "  {} · {} · {}",
+                        image.path.display(),
+                        image.mime_type,
+                        images::format_bytes(image.byte_len)
+                    );
+                }
+            }
+        }
     }
 
     fn handle_toggle_theme(&self) {
@@ -839,13 +1271,634 @@ impl CliSession {
                 return Ok(());
             }
         };
+        if governed_workspace_root()?.is_some() && mode == GooseMode::Auto {
+            output::render_error(
+                "Auto mode is unavailable in an ExactCode-governed session. Use /permissions to change approvals without leaving the workspace capability boundary.",
+            );
+            return Ok(());
+        }
         self.agent.update_goose_mode(mode, &self.session_id).await?;
         config.set_goose_mode(mode)?;
         output::goose_mode_message(&format!("Goose mode set to '{mode}'"));
         Ok(())
     }
 
-    async fn handle_model(&mut self, options: input::ModelCommandOptions) -> Result<()> {
+    async fn handle_permissions(&self, requested: Option<&str>) -> Result<()> {
+        let current = self
+            .agent
+            .config
+            .session_manager
+            .get_session(&self.session_id, false)
+            .await?
+            .goose_mode;
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        let policy = if let Some(policy) = requested {
+            policy.to_ascii_lowercase()
+        } else if !std::io::stdin().is_terminal() {
+            output::session_message(&format!(
+                "Current session approval policy: {}. Use /permissions ask|accept-edit|no-perms|read-only.",
+                permission_policy_name(current)
+            ));
+            return Ok(());
+        } else {
+            let items = vec![
+                (
+                    "ask".to_string(),
+                    "Ask".to_string(),
+                    "confirm every tool call".to_string(),
+                ),
+                (
+                    "accept-edit".to_string(),
+                    "Accept edits".to_string(),
+                    "ask only for sensitive calls".to_string(),
+                ),
+                (
+                    "no-perms".to_string(),
+                    "No prompts".to_string(),
+                    "let the governed host policy decide".to_string(),
+                ),
+                (
+                    "read-only".to_string(),
+                    "Read only".to_string(),
+                    "disable all tool calls in Goose".to_string(),
+                ),
+            ];
+            match cliclack::select("Approval policy for this session:")
+                .items(&items)
+                .initial_value(permission_policy_name(current).to_string())
+                .interact()
+            {
+                Ok(policy) => policy,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        let Some(mode) = permission_mode(&policy) else {
+            output::render_error(
+                "Unknown approval policy. Use ask, accept-edit, no-perms, or read-only.",
+            );
+            return Ok(());
+        };
+        self.agent.update_goose_mode(mode, &self.session_id).await?;
+        let boundary = if governed_workspace_root()?.is_some() {
+            " ExactCode's workspace capability and allow/deny policy remain the hard ceiling."
+        } else {
+            ""
+        };
+        output::session_message(&format!(
+            "Session approval policy set to '{}'.{boundary}",
+            permission_policy_name(mode)
+        ));
+        Ok(())
+    }
+
+    async fn effective_thinking_effort(&self) -> Result<ThinkingEffort> {
+        let model_config = self
+            .agent
+            .model_config_for_session(&self.session_id)
+            .await?;
+        Ok(model_config
+            .thinking_effort()
+            .or_else(|| Config::global().get_goose_thinking_effort())
+            .unwrap_or(ThinkingEffort::Off))
+    }
+
+    async fn handle_thinking(&mut self, requested: Option<&str>) -> Result<()> {
+        let current = self.effective_thinking_effort().await?;
+        let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+            output::session_message(&format!(
+                "Current session reasoning effort: '{current}'\n\
+                 Tip: use '/think off|low|medium|high|max' or press Shift+Tab to cycle."
+            ));
+            return Ok(());
+        };
+
+        if requested.split_whitespace().count() != 1 {
+            output::render_error("Expected one reasoning effort: off, low, medium, high, or max.");
+            return Ok(());
+        }
+        let effort = match ThinkingEffort::from_str(requested) {
+            Ok(effort) => effort,
+            Err(_) => {
+                output::render_error(&format!(
+                    "Invalid reasoning effort '{requested}'. Use off, low, medium, high, or max."
+                ));
+                return Ok(());
+            }
+        };
+        if effort == current {
+            output::session_message(&format!("Reasoning effort already set to '{effort}'"));
+            return Ok(());
+        }
+
+        self.agent
+            .update_thinking_effort(&self.session_id, effort)
+            .await?;
+        self.completion_cache
+            .write()
+            .unwrap()
+            .current_thinking_effort = effort;
+        output::session_message(&format!(
+            "Session reasoning effort changed from '{current}' to '{effort}'"
+        ));
+        Ok(())
+    }
+
+    async fn handle_cycle_thinking(&mut self) -> Result<()> {
+        let current = self.effective_thinking_effort().await?;
+        let next = next_thinking_effort(current);
+        self.handle_thinking(Some(&next.to_string())).await
+    }
+
+    async fn current_session_working_directory(&self) -> Result<PathBuf> {
+        Ok(self
+            .agent
+            .config
+            .session_manager
+            .get_session(&self.session_id, false)
+            .await?
+            .working_dir)
+    }
+
+    async fn handle_print_working_directory(&self) -> Result<()> {
+        let working_dir = self.current_session_working_directory().await?;
+        output::session_message(&format!("Working directory: {}", working_dir.display()));
+        Ok(())
+    }
+
+    async fn handle_change_directory(&mut self, requested: Option<&str>) -> Result<()> {
+        if requested.is_some_and(|value| value.trim().is_empty()) {
+            output::render_error(
+                "Expected one directory path. Quote paths containing spaces, for example: /cd '../other project'",
+            );
+            return Ok(());
+        }
+
+        let current = self.current_session_working_directory().await?;
+        let target = match resolve_working_directory(
+            requested,
+            &current,
+            self.previous_working_dir.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                output::render_error(&error.to_string());
+                return Ok(());
+            }
+        };
+        let target = match enforce_governed_workspace(&target) {
+            Ok(target) => target,
+            Err(error) => {
+                output::render_error(&error.to_string());
+                return Ok(());
+            }
+        };
+        if target == current {
+            output::session_message(&format!(
+                "Working directory already set to {}",
+                target.display()
+            ));
+            return Ok(());
+        }
+
+        self.agent
+            .config
+            .session_manager
+            .update(&self.session_id)
+            .working_dir(target.clone())
+            .apply()
+            .await?;
+        let session = self
+            .agent
+            .config
+            .session_manager
+            .get_session(&self.session_id, false)
+            .await?;
+        self.agent.restore_provider_from_session(&session).await?;
+        self.agent
+            .extension_manager
+            .update_working_dir(&target)
+            .await;
+        if let Err(error) = std::env::set_current_dir(&target) {
+            self.agent
+                .config
+                .session_manager
+                .update(&self.session_id)
+                .working_dir(current.clone())
+                .apply()
+                .await?;
+            return Err(error).with_context(|| {
+                format!("Failed to change working directory to {}", target.display())
+            });
+        }
+
+        self.previous_working_dir = Some(current);
+        output::session_message(&format!(
+            "Working directory changed to {}",
+            target.display()
+        ));
+        Ok(())
+    }
+
+    async fn user_sessions(&self) -> Result<Vec<Session>> {
+        let mut sessions = self
+            .agent
+            .config
+            .session_manager
+            .list_sessions_by_types(&[SessionType::User])
+            .await?;
+        if let Some(root) = governed_workspace_root()? {
+            sessions.retain(|session| {
+                session
+                    .working_dir
+                    .canonicalize()
+                    .is_ok_and(|path| path.starts_with(&root))
+            });
+        }
+        Ok(sessions)
+    }
+
+    async fn activate_session(&mut self, target_id: &str) -> Result<()> {
+        if target_id == self.session_id {
+            output::session_message("That session is already active");
+            return Ok(());
+        }
+
+        let manager = &self.agent.config.session_manager;
+        let target = manager.get_session(target_id, true).await?;
+        let target_working_dir = enforce_governed_workspace(&target.working_dir)
+            .with_context(|| format!("Cannot resume '{}'", target.name))?;
+
+        let old_session_id = self.session_id.clone();
+        let old_working_dir = self.current_session_working_directory().await?;
+        let process_working_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&target_working_dir).with_context(|| {
+            format!(
+                "Failed to switch to session working directory {}",
+                target_working_dir.display()
+            )
+        })?;
+        if let Err(error) = self.agent.restore_provider_from_session(&target).await {
+            let _ = std::env::set_current_dir(process_working_dir);
+            return Err(error).context("Failed to restore the session provider");
+        }
+
+        self.agent
+            .extension_manager
+            .update_working_dir(&target_working_dir)
+            .await;
+        self.agent
+            .emit_hook(goose::hooks::HookEvent::SessionEnd, &old_session_id)
+            .await;
+
+        self.session_id = target.id.clone();
+        self.messages = target.conversation.unwrap_or_default();
+        self.pending_images.clear();
+        self.run_mode = RunMode::Normal;
+        self.scheduled_job_id = None;
+        self.previous_working_dir = Some(old_working_dir);
+        self.update_completion_cache().await?;
+
+        output::session_message(&format!(
+            "Resumed '{}' · {} · {}",
+            target.name,
+            target.id,
+            target_working_dir.display()
+        ));
+        self.render_message_history();
+        Ok(())
+    }
+
+    async fn handle_new_session(&mut self, requested_name: Option<&str>) -> Result<()> {
+        let manager = &self.agent.config.session_manager;
+        let current = manager.get_session(&self.session_id, false).await?;
+        let name = requested_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("CLI Session")
+            .to_string();
+        let created = manager
+            .create_session(
+                current.working_dir.clone(),
+                name.clone(),
+                SessionType::User,
+                current.goose_mode,
+            )
+            .await?;
+
+        self.agent.persist_extension_state(&created.id).await?;
+        let mut update = manager.update(&created.id).goose_mode(current.goose_mode);
+        if requested_name.is_some() {
+            update = update.user_provided_name(name);
+        }
+        if let Some(provider_name) = current.provider_name {
+            update = update.provider_name(provider_name);
+        }
+        if let Some(model_config) = current.model_config {
+            update = update.model_config(model_config);
+        }
+        if let Some(project_id) = current.project_id {
+            update = update.project_id(Some(project_id));
+        }
+        update.apply().await?;
+
+        self.activate_session(&created.id).await
+    }
+
+    async fn handle_resume_session(&mut self, requested: Option<&str>) -> Result<()> {
+        let sessions = self.user_sessions().await?;
+        if sessions.is_empty() {
+            output::render_error("No saved sessions found");
+            return Ok(());
+        }
+
+        let target_id = if let Some(selector) = requested {
+            match resolve_session_selector(&sessions, selector) {
+                Ok(session) => session.id.clone(),
+                Err(error) => {
+                    output::render_error(&error.to_string());
+                    return Ok(());
+                }
+            }
+        } else {
+            let items: Vec<(String, String, String)> = sessions
+                .iter()
+                .map(|session| {
+                    let current = if session.id == self.session_id {
+                        " · current"
+                    } else {
+                        ""
+                    };
+                    (
+                        session.id.clone(),
+                        session.name.clone(),
+                        format!(
+                            "{} · {}{}",
+                            short_session_id(&session.id),
+                            session.updated_at.format("%Y-%m-%d %H:%M"),
+                            current
+                        ),
+                    )
+                })
+                .collect();
+            match cliclack::select("Resume a saved session:")
+                .items(&items)
+                .interact()
+            {
+                Ok(id) => id,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        self.activate_session(&target_id).await
+    }
+
+    async fn handle_fork_session(&mut self, requested_name: Option<&str>) -> Result<()> {
+        let manager = &self.agent.config.session_manager;
+        let current = manager.get_session(&self.session_id, false).await?;
+        let name = requested_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{} (fork)", current.name));
+        let fork = manager.copy_session(&self.session_id, name.clone()).await?;
+        manager
+            .update(&fork.id)
+            .user_provided_name(name)
+            .parent_session_id(Some(self.session_id.clone()))
+            .apply()
+            .await?;
+        self.activate_session(&fork.id).await
+    }
+
+    async fn handle_rename_session(&self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            output::render_error("Usage: /rename <name>");
+            return Ok(());
+        }
+        self.agent
+            .config
+            .session_manager
+            .update(&self.session_id)
+            .user_provided_name(name)
+            .apply()
+            .await?;
+        output::session_message(&format!("Renamed current session to '{name}'"));
+        Ok(())
+    }
+
+    async fn handle_list_sessions(&self) -> Result<()> {
+        let sessions = self.user_sessions().await?;
+        output::render_sessions(&sessions, &self.session_id);
+        Ok(())
+    }
+
+    async fn handle_diff(&self) -> Result<()> {
+        let working_dir = self.current_session_working_directory().await?;
+        match collect_worktree_diff(&working_dir) {
+            Ok(diff) if diff.is_empty() => output::session_message("Working tree is clean"),
+            Ok(diff) => output::render_worktree_diff(&diff),
+            Err(error) => output::render_error(&error.to_string()),
+        }
+        Ok(())
+    }
+
+    async fn handle_review(
+        &mut self,
+        instructions: Option<&str>,
+        history: &HistoryManager,
+        editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    ) -> Result<()> {
+        let working_dir = self.current_session_working_directory().await?;
+        let diff = match collect_worktree_diff(&working_dir) {
+            Ok(diff) if diff.is_empty() => {
+                output::session_message("Working tree is clean; there is nothing to review");
+                return Ok(());
+            }
+            Ok(diff) => diff,
+            Err(error) => {
+                output::render_error(&error.to_string());
+                return Ok(());
+            }
+        };
+        let (diff, truncated) = bounded_review_diff(&diff);
+        let extra = instructions
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("\nAdditional instructions: {value}\n"))
+            .unwrap_or_default();
+        let truncation = if truncated {
+            "\nThe embedded diff was truncated. Inspect the repository directly before concluding the review.\n"
+        } else {
+            ""
+        };
+        let prompt = format!(
+            "Review the current working-tree changes for correctness defects, regressions, security risks, and missing tests. Report findings first, ordered by severity, with precise file and line references. If there are no findings, say so explicitly.{extra}{truncation}\n```diff\n{diff}\n```"
+        );
+        self.handle_message_input(&prompt, history, editor).await
+    }
+
+    async fn handle_queue(&self, requested: Option<&str>) {
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        match requested {
+            Some(value) if value.eq_ignore_ascii_case("clear") => {
+                self.agent.discard_pending_steers(&self.session_id).await;
+                output::session_message("Queued guidance cleared");
+            }
+            Some(value) => {
+                self.agent
+                    .steer(&self.session_id, Message::user().with_text(value))
+                    .await;
+                let count = self.agent.pending_steer_count(&self.session_id).await;
+                output::session_message(&format!(
+                    "Queued guidance ({count} pending). It will be applied at the next safe model/tool boundary after you send the next prompt."
+                ));
+            }
+            None => {
+                let count = self.agent.pending_steer_count(&self.session_id).await;
+                output::session_message(&format!(
+                    "{count} queued follow-up(s). Use '/queue <message>' or '/queue clear'.\n\
+                     While a response streams, type guidance and press Enter to steer the active turn, or Tab to queue the next turn."
+                ));
+            }
+        }
+    }
+
+    async fn call_slash_tool(&self, tool_suffix: &str, arguments: JsonObject) -> Result<()> {
+        let tool_name = self
+            .agent
+            .list_tools(&self.session_id, None)
+            .await
+            .into_iter()
+            .find(|tool| slash_tool_matches(tool.name.as_ref(), tool_suffix))
+            .map(|tool| tool.name.into_owned());
+        let Some(tool_name) = tool_name else {
+            output::render_error(&format!(
+                "'{tool_suffix}' is unavailable in this session. Start ExactCode with its governed host bridge enabled."
+            ));
+            return Ok(());
+        };
+        let session = self
+            .agent
+            .config
+            .session_manager
+            .get_session(&self.session_id, false)
+            .await?;
+        let request = CallToolRequestParams::new(tool_name.clone()).with_arguments(arguments);
+        let request_id = format!(
+            "slash-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let (_, dispatched) = self
+            .agent
+            .dispatch_tool_call(request, request_id, None, &session)
+            .await;
+        let result = dispatched
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .result
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let text = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.is_empty() {
+            result
+                .structured_content
+                .as_ref()
+                .map(serde_json::to_string_pretty)
+                .transpose()?
+                .unwrap_or_else(|| "Tool completed without output".to_string())
+        } else {
+            text
+        };
+        if result.is_error.unwrap_or(false) {
+            output::render_error(&text);
+        } else {
+            output::session_message(&text);
+        }
+        Ok(())
+    }
+
+    async fn handle_process_list(&self) -> Result<()> {
+        self.call_slash_tool("process.list", JsonObject::new())
+            .await
+    }
+
+    async fn handle_stop_process(&self, process: &str) -> Result<()> {
+        let process = process.trim();
+        if !valid_process_id(process) {
+            output::render_error("Process ID may contain only letters, numbers, '-' and '_'.");
+            return Ok(());
+        }
+        let confirmed = match cliclack::confirm(format!("Stop background process '{process}'?"))
+            .initial_value(false)
+            .interact()
+        {
+            Ok(confirmed) => confirmed,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !confirmed {
+            output::session_message("Process was not stopped");
+            return Ok(());
+        }
+        self.call_slash_tool(
+            "process.kill",
+            serde_json::json!({"process_id": process})
+                .as_object()
+                .expect("literal object")
+                .clone(),
+        )
+        .await
+    }
+
+    async fn handle_subagents(&self) -> Result<()> {
+        self.call_slash_tool("summon__load", JsonObject::new())
+            .await
+    }
+
+    async fn handle_agent(&self, instructions: Option<&str>) -> Result<()> {
+        let Some(instructions) = instructions
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            output::session_message(
+                "Usage: /agent <instructions>\nUse /agent stop <task-id> to cancel a delegated task, or /subagents to inspect tasks.",
+            );
+            return Ok(());
+        };
+        if let Some(task_id) = instructions.strip_prefix("stop ").map(str::trim) {
+            if task_id.is_empty() || task_id.split_whitespace().count() != 1 {
+                output::render_error("Usage: /agent stop <task-id>");
+                return Ok(());
+            }
+            return self
+                .call_slash_tool(
+                    "summon__load",
+                    serde_json::json!({"source": task_id, "cancel": true})
+                        .as_object()
+                        .expect("literal object")
+                        .clone(),
+                )
+                .await;
+        }
+        self.call_slash_tool(
+            "summon__delegate",
+            serde_json::json!({"instructions": instructions, "async": true})
+                .as_object()
+                .expect("literal object")
+                .clone(),
+        )
+        .await
+    }
+
+    async fn handle_model(&mut self, mut options: input::ModelCommandOptions) -> Result<()> {
         let provider = self.agent.provider().await?;
         let current_provider_name = provider.get_name().to_string();
         let current_model_config = self
@@ -853,14 +1906,54 @@ impl CliSession {
             .model_config_for_session(&self.session_id)
             .await?;
         let current_model_name = current_model_config.model_name.clone();
+        let picker_requested = options.provider.is_none() && options.model.is_none();
 
-        if options.provider.is_none() && options.model.is_none() {
-            output::goose_mode_message(&format!(
-                "Current session model: '{}' (provider '{}')\n\
-                 Tip: use '/model <name>' to switch model, or '/model --provider <name> [model]' to switch provider.",
-                current_model_name, current_provider_name
-            ));
-            return Ok(());
+        if picker_requested {
+            let mut models = match provider.fetch_supported_models().await {
+                Ok(models) if !models.is_empty() => {
+                    self.completion_cache
+                        .write()
+                        .unwrap()
+                        .provider_models
+                        .insert(current_provider_name.clone(), models.clone());
+                    models
+                }
+                _ => self
+                    .completion_cache
+                    .read()
+                    .unwrap()
+                    .provider_models
+                    .get(&current_provider_name)
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            if !models.contains(&current_model_name) {
+                models.insert(0, current_model_name.clone());
+            }
+            models.sort();
+            models.dedup();
+            let items: Vec<(String, String, String)> = models
+                .into_iter()
+                .map(|model| {
+                    let description = if model == current_model_name {
+                        "current".to_string()
+                    } else {
+                        String::new()
+                    };
+                    (model.clone(), model, description)
+                })
+                .collect();
+            let selection = cliclack::select(format!(
+                "Select a model for provider '{current_provider_name}':"
+            ))
+            .items(&items)
+            .initial_value(current_model_name.clone())
+            .interact();
+            match selection {
+                Ok(model) => options.model = Some(model),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
         }
 
         let requested_provider = options
@@ -931,13 +2024,20 @@ impl CliSession {
             }
         };
 
-        let new_model_config = build_switched_model_config(
+        let mut new_model_config = build_switched_model_config(
             target_provider_name,
             &target_model_name,
             &current_model_config,
         )?;
 
         let configured_effort = Config::global().get_goose_thinking_effort();
+        if picker_requested {
+            new_model_config = preserve_picker_thinking_effort(
+                new_model_config,
+                &current_model_config,
+                configured_effort,
+            );
+        }
         let new_effort = new_model_config.thinking_effort().or(configured_effort);
         let current_effort = current_model_config.thinking_effort().or(configured_effort);
         let provider_unchanged = target_provider_name == current_provider_name;
@@ -1027,7 +2127,10 @@ impl CliSession {
         }
 
         let mut plan_messages = self.messages.clone();
-        plan_messages.push(Message::user().with_text(&options.message_text));
+        plan_messages.push(images::message_with_images(
+            &options.message_text,
+            &mut self.pending_images,
+        ));
 
         let (reasoner, reasoner_model_config) = get_reasoner().await?;
         self.plan_with_reasoner_model(plan_messages, reasoner, reasoner_model_config)
@@ -1064,6 +2167,7 @@ impl CliSession {
         }
 
         self.messages.clear();
+        self.pending_images.clear();
         tracing::info!("Chat context cleared by user.");
         output::render_message(
             &Message::assistant().with_text("Chat context cleared.\n"),
@@ -1343,17 +2447,31 @@ impl CliSession {
         let run_started = Instant::now();
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
+        let live_input_enabled = interactive && !is_json_mode && !is_stream_json_mode;
+        let mut live_input = if live_input_enabled {
+            live_input::LiveInput::start(self.stream_input_prefill.take().unwrap_or_default())?
+        } else {
+            None
+        };
 
         use futures::StreamExt;
         loop {
             tokio::select! {
                 result = stream.next() => {
+                    if let Some(input) = live_input.as_mut() {
+                        input.clear_line()?;
+                    }
                     match result {
                         Some(Ok(AgentEvent::Message(message))) => {
                             if first_token_at.is_none() && message_has_text(&message) {
                                 first_token_at = Some(Instant::now());
                             }
                             if let Some((id, security_prompt)) = find_tool_confirmation(&message) {
+                                let buffered_input = live_input
+                                    .take()
+                                    .map(live_input::LiveInput::stop)
+                                    .transpose()?
+                                    .unwrap_or_default();
                                 let permission = if interactive {
                                     prompt_tool_confirmation(&security_prompt)?
                                 } else {
@@ -1401,6 +2519,9 @@ impl CliSession {
                                     principal_type: PrincipalType::Tool,
                                     permission,
                                 }).await;
+                                if live_input_enabled {
+                                    live_input = live_input::LiveInput::start(buffered_input)?;
+                                }
                             } else if let Some((elicitation_id, elicitation_message, schema)) = find_elicitation_request(&message) {
                                 if !interactive {
                                     // Non-interactive/headless mode: cannot collect user input
@@ -1416,6 +2537,11 @@ impl CliSession {
 
                                 output::hide_thinking();
                                 let _ = progress_bars.hide();
+                                let buffered_input = live_input
+                                    .take()
+                                    .map(live_input::LiveInput::stop)
+                                    .transpose()?
+                                    .unwrap_or_default();
 
                                 match elicitation::collect_elicitation_input(&elicitation_message, &schema) {
                                     Ok(input) => {
@@ -1457,6 +2583,9 @@ impl CliSession {
                                         drop(stream);
                                         break;
                                     }
+                                }
+                                if live_input_enabled {
+                                    live_input = live_input::LiveInput::start(buffered_input)?;
                                 }
                             } else {
                                 log_tool_metrics(&message, &self.messages);
@@ -1513,6 +2642,35 @@ impl CliSession {
                         }
                         None => break,
                     }
+                    if let Some(input) = live_input.as_mut() {
+                        input.redraw()?;
+                    }
+                }
+                action = async {
+                    live_input
+                        .as_mut()
+                        .expect("live input select branch is guarded")
+                        .next_action()
+                        .await
+                }, if live_input.is_some() => {
+                    match action? {
+                        Some(live_input::LiveInputAction::Steer(message)) => {
+                            self.agent
+                                .steer(&self.session_id, Message::user().with_text(&message))
+                                .await;
+                            output::run_status_hook("steered");
+                        }
+                        Some(live_input::LiveInputAction::Queue(message)) => {
+                            self.queued_followups.push_back(message);
+                            output::run_status_hook("queued follow-up");
+                        }
+                        Some(live_input::LiveInputAction::Cancel) => {
+                            cancel_token_clone.cancel();
+                        }
+                        None => {
+                            live_input = None;
+                        }
+                    }
                 }
                 _ = cancel_token_clone.cancelled() => {
                     drop(stream);
@@ -1521,6 +2679,13 @@ impl CliSession {
                     }
                     break;
                 }
+            }
+        }
+
+        if let Some(input) = live_input.take() {
+            let prefill = input.stop()?;
+            if !prefill.is_empty() {
+                self.stream_input_prefill = Some(prefill);
             }
         }
 
@@ -1686,7 +2851,9 @@ impl CliSession {
     pub async fn update_completion_cache(&mut self) -> Result<()> {
         let prompts = self.agent.list_extension_prompts(&self.session_id).await;
         let all_providers = goose::providers::providers().await;
+        let sessions = self.user_sessions().await.unwrap_or_default();
         let session_provider = self.agent.provider().await?.get_name().to_string();
+        let session_thinking_effort = self.effective_thinking_effort().await?;
 
         let provider_ids: Vec<String> = all_providers.iter().map(|(m, _)| m.name.clone()).collect();
         let inventory_models: HashMap<String, Vec<String>> = {
@@ -1738,6 +2905,13 @@ impl CliSession {
 
         cache.provider_names = all_providers.iter().map(|(m, _)| m.name.clone()).collect();
         cache.current_session_provider = session_provider;
+        cache.current_thinking_effort = session_thinking_effort;
+        cache.session_selectors = sessions
+            .into_iter()
+            .flat_map(|session| [session.name, session.id])
+            .collect();
+        cache.session_selectors.sort();
+        cache.session_selectors.dedup();
         cache.provider_models.clear();
         for (metadata, _) in &all_providers {
             let mut models: Vec<String> = metadata
@@ -2601,14 +3775,258 @@ fn build_switched_model_config(
         .map_err(|e| anyhow::anyhow!("Failed to create model configuration: {e}"))
 }
 
+fn preserve_picker_thinking_effort(
+    target: goose_providers::model::ModelConfig,
+    current: &goose_providers::model::ModelConfig,
+    configured: Option<ThinkingEffort>,
+) -> goose_providers::model::ModelConfig {
+    match current.thinking_effort().or(configured) {
+        Some(effort) => target.with_thinking_effort(effort),
+        None => target,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exactcode_permission_names_map_to_goose_modes() {
+        assert_eq!(permission_mode("ask"), Some(GooseMode::Approve));
+        assert_eq!(
+            permission_mode("accept-edit"),
+            Some(GooseMode::SmartApprove)
+        );
+        assert_eq!(permission_mode("no-perms"), Some(GooseMode::Auto));
+        assert_eq!(permission_mode("read-only"), Some(GooseMode::Chat));
+        assert_eq!(permission_mode("anything-else"), None);
+        for mode in [
+            GooseMode::Approve,
+            GooseMode::SmartApprove,
+            GooseMode::Auto,
+            GooseMode::Chat,
+        ] {
+            assert_eq!(permission_mode(permission_policy_name(mode)), Some(mode));
+        }
+    }
+
+    #[test]
+    fn deterministic_slash_tools_match_prefixed_registration_names() {
+        assert!(slash_tool_matches(
+            "exactcode_host__process.list",
+            "process.list"
+        ));
+        assert!(slash_tool_matches("summon__delegate", "delegate"));
+        assert!(!slash_tool_matches(
+            "other__process.list.extra",
+            "process.list"
+        ));
+        assert!(valid_process_id("proc-123_abc"));
+        assert!(!valid_process_id(""));
+        assert!(!valid_process_id("123;kill"));
+        assert!(!valid_process_id("two ids"));
+    }
     use goose::agents::extension::Envs;
     use goose::config::ExtensionConfig;
     use std::collections::HashMap;
     use std::time::Duration;
     use test_case::test_case;
+
+    #[test]
+    fn thinking_effort_cycle_wraps_after_max() {
+        assert_eq!(
+            next_thinking_effort(ThinkingEffort::Off),
+            ThinkingEffort::Low
+        );
+        assert_eq!(
+            next_thinking_effort(ThinkingEffort::Low),
+            ThinkingEffort::Medium
+        );
+        assert_eq!(
+            next_thinking_effort(ThinkingEffort::Medium),
+            ThinkingEffort::High
+        );
+        assert_eq!(
+            next_thinking_effort(ThinkingEffort::High),
+            ThinkingEffort::Max
+        );
+        assert_eq!(
+            next_thinking_effort(ThinkingEffort::Max),
+            ThinkingEffort::Off
+        );
+    }
+
+    #[test]
+    fn working_directory_resolution_supports_relative_paths_and_dash() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current");
+        let sibling = temp.path().join("sibling");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        assert_eq!(
+            resolve_working_directory(Some("../sibling"), &current, None).unwrap(),
+            sibling.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_working_directory(Some("-"), &sibling, Some(&current)).unwrap(),
+            current.canonicalize().unwrap()
+        );
+        assert!(resolve_working_directory(Some("missing"), &current, None).is_err());
+    }
+
+    #[test]
+    fn governed_workspace_rejects_escape_and_developer_reenable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let inside = root.join("nested");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let root_string = root.to_string_lossy().to_string();
+        let _guard = env_lock::lock_env([
+            (GOVERNED_SESSION_ENV, Some("1")),
+            (GOVERNED_WORKSPACE_ENV, Some(root_string.as_str())),
+        ]);
+
+        assert_eq!(
+            enforce_governed_workspace(&inside).unwrap(),
+            inside.canonicalize().unwrap()
+        );
+        assert!(enforce_governed_workspace(&outside).is_err());
+        assert!(governed_builtin_is_blocked("developer"));
+        assert!(governed_builtin_is_blocked("todo, Developer"));
+        assert!(!governed_builtin_is_blocked("todo"));
+    }
+
+    #[test]
+    fn ordinary_goose_session_keeps_normal_extension_and_directory_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let _guard = env_lock::lock_env([
+            (GOVERNED_SESSION_ENV, None::<&str>),
+            (GOVERNED_WORKSPACE_ENV, None::<&str>),
+        ]);
+
+        assert_eq!(
+            enforce_governed_workspace(&outside).unwrap(),
+            outside.canonicalize().unwrap()
+        );
+        assert!(!governed_builtin_is_blocked("developer"));
+    }
+
+    #[tokio::test]
+    async fn session_selector_accepts_name_exact_id_and_unique_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(temp.path().to_path_buf());
+        let first = manager
+            .create_session(
+                temp.path().to_path_buf(),
+                "first task".to_string(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .create_session(
+                temp.path().to_path_buf(),
+                "second task".to_string(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let sessions = vec![first.clone(), second.clone()];
+
+        assert_eq!(
+            resolve_session_selector(&sessions, "first task")
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert_eq!(
+            resolve_session_selector(&sessions, &second.id).unwrap().id,
+            second.id
+        );
+        let unique_prefix = (1..=first.id.chars().count())
+            .map(|end| first.id.chars().take(end).collect::<String>())
+            .find(|prefix| {
+                sessions
+                    .iter()
+                    .filter(|session| session.id.starts_with(prefix))
+                    .count()
+                    == 1
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_session_selector(&sessions, &unique_prefix)
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert!(resolve_session_selector(&sessions, "missing").is_err());
+
+        let mut ambiguous_a = first;
+        let mut ambiguous_b = second;
+        ambiguous_a.id = "shared-a".to_string();
+        ambiguous_b.id = "shared-b".to_string();
+        assert!(resolve_session_selector(&[ambiguous_a, ambiguous_b], "shared").is_err());
+
+        let mut duplicate_a = sessions[0].clone();
+        let mut duplicate_b = sessions[1].clone();
+        duplicate_a.name = "duplicate".to_string();
+        duplicate_b.name = "duplicate".to_string();
+        assert!(resolve_session_selector(&[duplicate_a, duplicate_b], "duplicate").is_err());
+    }
+
+    #[test]
+    fn worktree_diff_includes_tracked_staged_and_untracked_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "goose@example.invalid"]);
+        git(&["config", "user.name", "Goose Test"]);
+        std::fs::write(root.join("tracked.txt"), "before\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "initial"]);
+
+        std::fs::write(root.join("tracked.txt"), "after\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "after again\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "brand new\n").unwrap();
+
+        let diff = collect_worktree_diff(root).unwrap();
+        assert!(diff.contains("-before"));
+        assert!(diff.contains("+after again"));
+        assert!(diff.contains("untracked.txt"));
+        assert!(diff.contains("+brand new"));
+    }
+
+    #[test]
+    fn review_diff_is_bounded_on_a_character_boundary() {
+        let input = "é".repeat(REVIEW_DIFF_LIMIT);
+        let (bounded, truncated) = bounded_review_diff(&input);
+        assert!(truncated);
+        assert!(bounded.len() <= REVIEW_DIFF_LIMIT);
+        assert!(bounded.len() > REVIEW_DIFF_LIMIT - "é".len());
+        assert!(bounded.is_char_boundary(bounded.len()));
+    }
 
     #[test]
     fn planner_classification_excludes_user_only_content() {
@@ -2874,6 +4292,17 @@ mod tests {
 
         assert_eq!(switched.model_name, current.model_name);
         assert_ne!(switched.thinking_effort(), current.thinking_effort());
+    }
+
+    #[test]
+    fn model_picker_preserves_session_thinking_effort() {
+        let current = goose_providers::model::ModelConfig::new("gpt-5.4")
+            .with_thinking_effort(ThinkingEffort::Medium);
+        let target = goose_providers::model::ModelConfig::new("gpt-5.6");
+
+        let switched = preserve_picker_thinking_effort(target, &current, None);
+
+        assert_eq!(switched.thinking_effort(), Some(ThinkingEffort::Medium));
     }
 
     #[test]

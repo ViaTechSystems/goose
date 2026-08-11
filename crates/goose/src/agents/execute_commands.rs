@@ -44,7 +44,7 @@ static COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         name: "goal",
-        description: "Set a goal the agent must satisfy before finishing, or clear with /goal off",
+        description: "Start or inspect a durable verified goal; edit, pause, resume, or clear it",
     },
     CommandDef {
         name: "grind",
@@ -103,7 +103,7 @@ pub fn is_known_slash_command(message_text: &str, working_dir: Option<&Path>) ->
             .any(|command| command.name.eq_ignore_ascii_case(parsed.command))
 }
 
-fn is_clear_goal_param(params_str: &str) -> bool {
+fn is_clear_grind_param(params_str: &str) -> bool {
     matches!(params_str, "off" | "clear" | "none")
 }
 
@@ -114,9 +114,10 @@ pub fn command_starts_turn(message_text: &str) -> bool {
     let Some(parsed) = parse_slash_command(message_text) else {
         return false;
     };
-    matches!(parsed.command, "goal" | "grind")
-        && !parsed.params_str.is_empty()
-        && !is_clear_goal_param(parsed.params_str)
+    (parsed.command == "goal" && super::goal::goal_command_starts_turn(parsed.params_str))
+        || (parsed.command == "grind"
+            && !parsed.params_str.is_empty()
+            && !is_clear_grind_param(parsed.params_str))
 }
 
 impl Agent {
@@ -146,7 +147,7 @@ impl Agent {
             "skills" => self.handle_skills_command(session_id).await,
             "doctor" => Ok(Some(crate::doctor::run(self, session_id).await?)),
             "status" => self.handle_status_command(session_id).await,
-            "goal" => self.handle_goal_command(params_str).await,
+            "goal" => self.handle_goal_command(params_str, session_id).await,
             "grind" => self.handle_grind_command(params_str).await,
             _ => {
                 if let Some(message) = self
@@ -479,28 +480,106 @@ impl Agent {
         }
     }
 
-    async fn handle_goal_command(&self, params_str: &str) -> Result<Option<Message>> {
-        if params_str.is_empty() {
-            let current = self.get_goal().await;
+    async fn handle_goal_command(
+        &self,
+        params_str: &str,
+        session_id: &str,
+    ) -> Result<Option<Message>> {
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
+        let action = super::goal::parse_goal_command(params_str);
+        if action == super::goal::GoalCommand::Inspect {
+            let mut current = super::goal::GoalState::from_session(&session);
+            if let Some(goal) = current.as_mut() {
+                if goal.invalidate_if_worktree_changed(&session.working_dir) {
+                    self.persist_session_goal(session_id, goal).await?;
+                    self.set_goal(Some(goal.objective.clone())).await;
+                }
+            }
             let text = match current {
-                Some(goal) => format!("Current goal: {goal}"),
-                None => "No goal set. Use `/goal <description>` to set one.".to_string(),
+                Some(goal) => goal.render(),
+                None => "No goal set. Use `/goal <description>` to set one; `/goal edit|pause|resume|clear` manages it.".to_string(),
             };
-            return Ok(Some(Message::assistant().with_text(text)));
+            return Ok(Some(user_only_assistant_text(text)));
         }
 
-        if is_clear_goal_param(params_str) {
+        let current = super::goal::GoalState::from_session(&session);
+        let (goal, text) = match action {
+            super::goal::GoalCommand::Start(objective) => {
+                let goal = super::goal::GoalState::start(objective, &session.working_dir);
+                let text = format!(
+                    "Verified goal started. Completion now requires a model completion verdict and fresh successful test, lint, typecheck, or build evidence.\n\n{}",
+                    goal.render()
+                );
+                (Some(goal), text)
+            }
+            super::goal::GoalCommand::Edit(objective) => {
+                let Some(mut goal) = current else {
+                    return Ok(Some(user_only_assistant_text(
+                        "No goal set. Use `/goal <description>` to start one.",
+                    )));
+                };
+                goal.edit(objective, &session.working_dir);
+                let text = format!(
+                    "Goal objective edited; prior evidence was reset.\n\n{}",
+                    goal.render()
+                );
+                (Some(goal), text)
+            }
+            super::goal::GoalCommand::Pause => {
+                let Some(mut goal) = current else {
+                    return Ok(Some(user_only_assistant_text("No goal set.")));
+                };
+                if !goal.pause() {
+                    return Ok(Some(user_only_assistant_text(
+                        "Only an active goal can be paused.",
+                    )));
+                }
+                let text = format!("Goal paused.\n\n{}", goal.render());
+                (Some(goal), text)
+            }
+            super::goal::GoalCommand::Resume => {
+                let Some(mut goal) = current else {
+                    return Ok(Some(user_only_assistant_text("No goal set.")));
+                };
+                if !goal.resume() {
+                    return Ok(Some(user_only_assistant_text(
+                        "Only a paused goal can be resumed.",
+                    )));
+                }
+                let text = format!("Goal resumed.\n\n{}", goal.render());
+                (Some(goal), text)
+            }
+            super::goal::GoalCommand::Abandon => {
+                let goal = current.map(|mut goal| {
+                    goal.abandon();
+                    goal
+                });
+                (goal, "Goal abandoned and retained in the session evidence. The agent will finish normally.".to_string())
+            }
+            super::goal::GoalCommand::Clear => {
+                self.clear_session_goal(session_id).await?;
+                self.set_goal(None).await;
+                return Ok(Some(user_only_assistant_text(
+                    "Goal and its retained evidence cleared from this session.",
+                )));
+            }
+            super::goal::GoalCommand::Invalid(message) => {
+                return Ok(Some(user_only_assistant_text(message)));
+            }
+            super::goal::GoalCommand::Inspect => unreachable!(),
+        };
+        if let Some(goal) = goal {
+            self.persist_session_goal(session_id, &goal).await?;
+            self.set_goal(goal.is_active().then(|| goal.objective.clone()))
+                .await;
+        } else {
             self.set_goal(None).await;
-            return Ok(Some(
-                Message::assistant().with_text("Goal cleared. The agent will finish normally."),
-            ));
         }
-
-        let goal = params_str.to_string();
-        self.set_goal(Some(goal.clone())).await;
-        Ok(Some(Message::assistant().with_text(format!(
-            "Goal set. The agent will verify this goal is met before finishing:\n\n> {goal}"
-        ))))
+        Ok(Some(user_only_assistant_text(text)))
     }
 
     async fn handle_grind_command(&self, params_str: &str) -> Result<Option<Message>> {
@@ -513,7 +592,7 @@ impl Agent {
             return Ok(Some(Message::assistant().with_text(text)));
         }
 
-        if is_clear_goal_param(params_str) {
+        if is_clear_grind_param(params_str) {
             self.set_grind(None).await;
             return Ok(Some(
                 Message::assistant().with_text("Grind cleared. The agent will finish normally."),

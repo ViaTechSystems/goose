@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::time::Duration;
 
+use crate::agents::goal::{self, GoalState, GoalVerdict};
 use crate::agents::retry::{
     execute_on_failure_command_with_timeout, execute_success_checks_with_timeout,
 };
@@ -80,6 +81,148 @@ impl<'a> RetryOperation<'a> {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32
     }
+
+    async fn run_goal_command(
+        &self,
+        command: &SlashCommand<'_>,
+        session: &Session,
+        conversation: &Conversation,
+        emit: &Emitter,
+    ) -> Result<OperationResult> {
+        let params = command.params_str;
+        let action = goal::parse_goal_command(params);
+        let mut extension_data = session.extension_data.clone();
+        let mut extension_changed = false;
+        let mut started_goal = None;
+
+        let current = GoalState::from_session(session);
+        let response = match action {
+            goal::GoalCommand::Inspect => match current {
+                Some(mut state) => {
+                    if state.invalidate_if_worktree_changed(&session.working_dir) {
+                        state.write_to(&mut extension_data)?;
+                        extension_changed = true;
+                        *self.goal.lock().await = Some(state.objective.clone());
+                    }
+                    Message::assistant().with_text(state.render())
+                }
+                None => Message::assistant().with_text(
+                    "No goal set. Use `/goal <description>` to set one; `/goal edit|pause|resume|clear` manages it.",
+                ),
+            },
+            goal::GoalCommand::Start(objective) => {
+                let state = GoalState::start(objective, &session.working_dir);
+                state.write_to(&mut extension_data)?;
+                extension_changed = true;
+                *self.goal.lock().await = Some(state.objective.clone());
+                let response = Message::assistant().with_text(format!(
+                    "Verified goal started. Completion now requires a model completion verdict and fresh successful test, lint, typecheck, or build evidence.\n\n{}",
+                    state.render()
+                ));
+                started_goal = Some(state);
+                response
+            }
+            goal::GoalCommand::Edit(objective) => match current {
+                Some(mut state) => {
+                    state.edit(objective, &session.working_dir);
+                    state.write_to(&mut extension_data)?;
+                    extension_changed = true;
+                    *self.goal.lock().await = Some(state.objective.clone());
+                    let response = Message::assistant().with_text(format!(
+                        "Goal objective edited; prior evidence was reset.\n\n{}",
+                        state.render()
+                    ));
+                    response
+                }
+                None => Message::assistant()
+                    .with_text("No goal set. Use `/goal <description>` to start one."),
+            },
+            goal::GoalCommand::Pause => match current {
+                Some(mut state) => {
+                    if state.pause() {
+                        state.write_to(&mut extension_data)?;
+                        extension_changed = true;
+                        *self.goal.lock().await = None;
+                        Message::assistant()
+                            .with_text(format!("Goal paused.\n\n{}", state.render()))
+                    } else {
+                        Message::assistant().with_text("Only an active goal can be paused.")
+                    }
+                }
+                None => Message::assistant().with_text("No goal set."),
+            },
+            goal::GoalCommand::Resume => match current {
+                Some(mut state) => {
+                    if state.resume() {
+                        state.write_to(&mut extension_data)?;
+                        extension_changed = true;
+                        *self.goal.lock().await = Some(state.objective.clone());
+                        let response = Message::assistant()
+                            .with_text(format!("Goal resumed.\n\n{}", state.render()));
+                        response
+                    } else {
+                        Message::assistant().with_text("Only a paused goal can be resumed.")
+                    }
+                }
+                None => Message::assistant().with_text("No goal set."),
+            },
+            goal::GoalCommand::Abandon => {
+                if let Some(mut state) = current {
+                    state.abandon();
+                    state.write_to(&mut extension_data)?;
+                    extension_changed = true;
+                }
+                *self.goal.lock().await = None;
+                Message::assistant().with_text(
+                    "Goal abandoned and retained in the session evidence. The agent will finish normally.",
+                )
+            }
+            goal::GoalCommand::Clear => {
+                extension_data.extension_states.remove("exactcode_goal.v1");
+                extension_changed = true;
+                *self.goal.lock().await = None;
+                Message::assistant().with_text(
+                    "Goal and its retained evidence cleared from this session.",
+                )
+            }
+            goal::GoalCommand::Invalid(message) => Message::assistant().with_text(message),
+        };
+
+        let command_message = messages_since_kickoff(conversation)?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("slash command conversation has no kickoff message"))?;
+        let message_id = command_message
+            .id
+            .clone()
+            .ok_or_else(|| anyhow!("Persisted slash command message has no id"))?;
+        emit.message(command_message.with_visibility(true, false))
+            .await;
+        let response = emit.message(response.with_visibility(true, false)).await;
+
+        let mut effects = vec![
+            StateEffect::SetMessageVisibility {
+                message_id,
+                user_visible: true,
+                agent_visible: false,
+            },
+            response.into(),
+        ];
+        if extension_changed {
+            effects.push(StateEffect::SetExtensionData(extension_data));
+        }
+        if let Some(goal) = started_goal {
+            effects.push(
+                Message::user()
+                    .with_text(goal::kickoff_prompt(&goal))
+                    .with_visibility(false, true)
+                    .into(),
+            );
+            applied(effects)
+        } else {
+            yielded_with(effects)
+        }
+    }
 }
 
 #[async_trait]
@@ -91,20 +234,21 @@ impl Operation for RetryOperation<'_> {
     async fn run_command(
         &self,
         command: &SlashCommand<'_>,
-        _session: &Session,
+        session: &Session,
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult> {
+        if command.command == "goal" {
+            return self
+                .run_goal_command(command, session, conversation, emit)
+                .await;
+        }
+
         let target = match command.command {
-            "goal" => &self.goal,
             "grind" => &self.grind,
             _ => return not_applicable(),
         };
-        let label = if command.command == "goal" {
-            "goal"
-        } else {
-            "grind goal"
-        };
+        let label = "grind goal";
         let params = command.params_str;
         let starts_turn = !params.is_empty() && !matches!(params, "off" | "clear" | "none");
 
@@ -118,24 +262,12 @@ impl Operation for RetryOperation<'_> {
             }
         } else if !starts_turn {
             *target.lock().await = None;
-            let text = if command.command == "goal" {
-                "Goal cleared. The agent will finish normally."
-            } else {
-                "Grind cleared. The agent will finish normally."
-            };
-            Message::assistant().with_text(text)
+            Message::assistant().with_text("Grind cleared. The agent will finish normally.")
         } else {
             *target.lock().await = Some(params.to_string());
-            let text = if command.command == "goal" {
-                format!(
-                    "Goal set. The agent will verify this goal is met before finishing:\n\n> {params}"
-                )
-            } else {
-                format!(
-                    "Grind goal set. The agent will keep working until max_turns is reached:\n\n> {params}"
-                )
-            };
-            Message::assistant().with_text(text)
+            Message::assistant().with_text(format!(
+                "Grind goal set. The agent will keep working until max_turns is reached:\n\n> {params}"
+            ))
         };
 
         let command_message = messages_since_kickoff(conversation)?
@@ -185,22 +317,91 @@ impl Operation for RetryOperation<'_> {
             return not_applicable();
         }
 
-        if !self.goal_was_nudged(messages) {
+        if let Some(mut state) = GoalState::from_session(session).filter(GoalState::is_active) {
+            let assistant_text = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == rmcp::model::Role::Assistant)
+                .map(Message::as_concat_text)
+                .unwrap_or_default();
+            match goal::parse_verdict(&assistant_text) {
+                GoalVerdict::Complete => {
+                    let mut extension_data = session.extension_data.clone();
+                    if state.evaluate_completion(&session.working_dir, conversation) {
+                        state.write_to(&mut extension_data)?;
+                        *self.goal.lock().await = None;
+                        emit.message(Message::assistant().with_system_notification(
+                            SystemNotificationType::InlineMessage,
+                            "Goal VERIFIED: completion claim and objective evidence both passed.",
+                        ))
+                        .await;
+                        return applied([StateEffect::SetExtensionData(extension_data)]);
+                    }
+                    state.write_to(&mut extension_data)?;
+                    let mut message = Message::user()
+                        .with_text(goal::verification_nudge(&state))
+                        .with_visibility(false, true);
+                    self.set_message_meta(&mut message, NUDGED, serde_json::json!(true));
+                    emit.message(Message::assistant().with_system_notification(
+                        SystemNotificationType::InlineMessage,
+                        format!(
+                            "Goal evidence rejected: {}",
+                            state.evidence.failure_reason()
+                        ),
+                    ))
+                    .await;
+                    return applied([
+                        StateEffect::SetExtensionData(extension_data),
+                        message.into(),
+                    ]);
+                }
+                GoalVerdict::Blocked => {
+                    state.block("the agent reported GOAL_STATUS: blocked");
+                    let mut extension_data = session.extension_data.clone();
+                    state.write_to(&mut extension_data)?;
+                    *self.goal.lock().await = None;
+                    emit.message(Message::assistant().with_system_notification(
+                        SystemNotificationType::InlineMessage,
+                        "Goal BLOCKED and retained with its evidence.",
+                    ))
+                    .await;
+                    return applied([StateEffect::SetExtensionData(extension_data)]);
+                }
+                GoalVerdict::Continue => {
+                    let mut message = Message::user()
+                        .with_text(goal::verification_nudge(&state))
+                        .with_visibility(false, true);
+                    self.set_message_meta(&mut message, NUDGED, serde_json::json!(true));
+                    emit.message(Message::assistant().with_system_notification(
+                        SystemNotificationType::InlineMessage,
+                        format!("Goal ACTIVE: {}", state.objective),
+                    ))
+                    .await;
+                    return applied([message.into()]);
+                }
+                GoalVerdict::Unspecified if !self.goal_was_nudged(messages) => {
+                    let mut message = Message::user()
+                        .with_text(goal::verification_nudge(&state))
+                        .with_visibility(false, true);
+                    self.set_message_meta(&mut message, NUDGED, serde_json::json!(true));
+                    emit.message(Message::assistant().with_system_notification(
+                        SystemNotificationType::InlineMessage,
+                        format!("Goal ACTIVE: {}", state.objective),
+                    ))
+                    .await;
+                    return applied([message.into()]);
+                }
+                GoalVerdict::Unspecified => {}
+            }
+        } else if !self.goal_was_nudged(messages) {
+            // Compatibility for callers that still set the transient Agent goal directly.
             if let Some(goal) = self.goal.lock().await.clone() {
-                let nudge = format!(
-                    "Before finishing, check whether the following goal has been fully met:\n\n\
-                     **Goal:** {goal}\n\n\
-                     If not, continue working toward it."
-                );
                 let mut message = Message::user()
-                    .with_text(&nudge)
+                    .with_text(format!(
+                        "Before finishing, check whether this goal is fully met:\n\n**Goal:** {goal}"
+                    ))
                     .with_visibility(false, true);
                 self.set_message_meta(&mut message, NUDGED, serde_json::json!(true));
-                emit.message(Message::assistant().with_system_notification(
-                    SystemNotificationType::InlineMessage,
-                    format!("Goal: {goal}"),
-                ))
-                .await;
                 return applied([message.into()]);
             }
         }
@@ -222,7 +423,9 @@ impl Operation for RetryOperation<'_> {
             return applied([message.into()]);
         }
 
-        *self.goal.lock().await = None;
+        if GoalState::from_session(session).is_none() {
+            *self.goal.lock().await = None;
+        }
         *self.grind.lock().await = None;
 
         let Some(retry_config) = Self::retry_config(session) else {

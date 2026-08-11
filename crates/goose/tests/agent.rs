@@ -2219,12 +2219,21 @@ mod tests {
 
         struct GoalTextProvider {
             call_count: AtomicU32,
+            response: Option<&'static str>,
         }
 
         impl GoalTextProvider {
             fn new() -> Self {
                 Self {
                     call_count: AtomicU32::new(0),
+                    response: None,
+                }
+            }
+
+            fn with_response(response: &'static str) -> Self {
+                Self {
+                    call_count: AtomicU32::new(0),
+                    response: Some(response),
                 }
             }
         }
@@ -2267,7 +2276,10 @@ mod tests {
                 _tools: &[Tool],
             ) -> Result<MessageStream, ProviderError> {
                 let count = self.call_count.fetch_add(1, Ordering::SeqCst);
-                let text = format!("Response number {count}");
+                let text = self
+                    .response
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Response number {count}"));
                 let message = Message::assistant().with_text(&text);
                 let usage = ProviderUsage::new(
                     "mock-model".to_string(),
@@ -2378,6 +2390,70 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_explicit_durable_goal_continuation_reaches_max_turns() -> Result<()> {
+            let temp_dir = TempDir::new()?;
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+            let agent = create_agent_with_session_naming_disabled(session_manager.clone());
+            let provider = Arc::new(GoalTextProvider::with_response("GOAL_STATUS: continue"));
+            let session = session_manager
+                .create_session(
+                    temp_dir.path().to_path_buf(),
+                    "durable-goal-continue".to_string(),
+                    SessionType::Hidden,
+                    GooseMode::default(),
+                )
+                .await?;
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+            agent
+                .execute_command("/goal keep improving", &session.id)
+                .await?;
+
+            let reply_stream = agent
+                .reply(
+                    Message::user().with_text("continue the goal"),
+                    SessionConfig {
+                        id: session.id.clone(),
+                        schedule_id: None,
+                        max_turns: Some(4),
+                        retry_config: None,
+                    },
+                    None,
+                )
+                .await?;
+            tokio::pin!(reply_stream);
+            let mut messages = Vec::new();
+            while let Some(event) = reply_stream.next().await {
+                if let AgentEvent::Message(message) = event? {
+                    messages.push(message);
+                }
+            }
+
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 4);
+            assert!(messages.iter().any(|message| {
+                message
+                    .as_concat_text()
+                    .contains("maximum number of actions")
+            }));
+            assert_eq!(agent.get_goal().await.as_deref(), Some("keep improving"));
+            let stored = session_manager.get_session(&session.id, false).await?;
+            assert_eq!(
+                stored
+                    .extension_data
+                    .get_extension_state("exactcode_goal", "v1")
+                    .expect("durable goal remains persisted")["status"],
+                "active"
+            );
+
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_no_goal_exits_immediately() -> Result<()> {
             let temp_dir = TempDir::new()?;
             let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
@@ -2453,11 +2529,18 @@ mod tests {
                 .execute_command("/goal make all tests pass", &session.id)
                 .await?
                 .unwrap();
-            assert!(result.as_concat_text().contains("Goal set"));
+            assert!(result.as_concat_text().contains("Verified goal started"));
             assert_eq!(
                 agent.get_goal().await,
                 Some("make all tests pass".to_string())
             );
+            let stored = session_manager.get_session(&session.id, false).await?;
+            let stored_goal = stored
+                .extension_data
+                .get_extension_state("exactcode_goal", "v1")
+                .expect("goal persisted in the Goose session");
+            assert_eq!(stored_goal["status"], "active");
+            assert_eq!(stored_goal["objective"], "make all tests pass");
 
             // Query it
             let result = agent.execute_command("/goal", &session.id).await?.unwrap();
@@ -2468,8 +2551,16 @@ mod tests {
                 .execute_command("/goal off", &session.id)
                 .await?
                 .unwrap();
-            assert!(result.as_concat_text().contains("cleared"));
+            assert!(result.as_concat_text().contains("abandoned"));
             assert_eq!(agent.get_goal().await, None);
+            let stored = session_manager.get_session(&session.id, false).await?;
+            assert_eq!(
+                stored
+                    .extension_data
+                    .get_extension_state("exactcode_goal", "v1")
+                    .expect("abandoned goal retained")["status"],
+                "abandoned"
+            );
 
             Ok(())
         }
@@ -2521,7 +2612,7 @@ mod tests {
             }
 
             // The provider must be invoked: setting a goal kicks off a turn
-            // (the goal-checking loop then runs and clears the goal once met).
+            // The verified goal remains durable until objective evidence proves it.
             assert!(
                 provider.call_count.load(Ordering::SeqCst) >= 1,
                 "Setting a goal should start an agent turn"
@@ -2531,7 +2622,7 @@ mod tests {
             assert!(
                 messages
                     .iter()
-                    .any(|m| m.as_concat_text().contains("Goal set")),
+                    .any(|m| m.as_concat_text().contains("Verified goal started")),
                 "Goal confirmation should be surfaced to the user"
             );
 
