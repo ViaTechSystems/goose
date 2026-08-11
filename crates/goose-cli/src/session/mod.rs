@@ -144,7 +144,7 @@ fn code_rewind_block_reason(
     capability_mode: Option<&str>,
     approval_mode: GooseMode,
 ) -> Option<&'static str> {
-    if governed && capability_mode == Some("read-only") {
+    if governed && matches!(capability_mode, Some("read_only" | "read-only")) {
         return Some(
             "Code rewind is unavailable under ExactCode's read-only capability policy. Conversation rewind and fork remain available.",
         );
@@ -4254,6 +4254,11 @@ mod tests {
     #[test]
     fn code_rewind_respects_capability_and_approval_read_only_boundaries() {
         assert!(
+            code_rewind_block_reason(true, Some("read_only"), GooseMode::Auto)
+                .unwrap()
+                .contains("capability")
+        );
+        assert!(
             code_rewind_block_reason(true, Some("read-only"), GooseMode::Auto)
                 .unwrap()
                 .contains("capability")
@@ -4262,11 +4267,11 @@ mod tests {
             .unwrap()
             .contains("approval"));
         assert_eq!(
-            code_rewind_block_reason(true, Some("workspace-write"), GooseMode::Approve),
+            code_rewind_block_reason(true, Some("workspace_write"), GooseMode::Approve),
             None
         );
         assert_eq!(
-            code_rewind_block_reason(true, Some("full-control"), GooseMode::Auto),
+            code_rewind_block_reason(true, Some("full_control"), GooseMode::Auto),
             None
         );
     }
