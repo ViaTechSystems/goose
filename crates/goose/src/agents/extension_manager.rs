@@ -3175,7 +3175,7 @@ mod tests {
             Some("exactcode-host__shell.exec")
         );
         assert_eq!(
-            governed_shell_tool_name("shell", &[host.clone()], false),
+            governed_shell_tool_name("shell", std::slice::from_ref(&host), false),
             None
         );
         assert_eq!(governed_shell_tool_name("other", &[host], true), None);
