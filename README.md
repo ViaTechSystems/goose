@@ -32,13 +32,52 @@ goose is part of the [Agentic AI Foundation (AAIF)](https://aaif.io/) at the Lin
 
 **[Download the desktop app](https://goose-docs.ai/docs/getting-started/installation)** for macOS, Linux, and Windows.
 
-The ViaTech fork's first binary release has not been published yet. Until its
-checksum-backed `stable` channel exists, install the current CLI from source:
+Install or update the ViaTech CLI on macOS, Linux, WSL, Android/Termux, Git
+Bash, or MSYS2 with the checksum-enforcing release installer:
+
+```bash
+curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
+```
+
+If the [ViaTech releases page](https://github.com/ViaTechSystems/goose/releases)
+does not yet show a `stable` release with binary and `.sha256` assets, or for a
+native PowerShell install, build the current CLI from source with Rust/Cargo:
 
 ```bash
 cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli \
   --locked --no-default-features --features rustls-tls,code-mode
 ```
+
+The CLI does not update itself in the background. For now, update a source
+install by rerunning the `cargo install` command above; that minimal source build
+does not include `goose update`. For a packaged install, rerun the download
+command (it rejects a missing, malformed, or mismatched SHA-256 sidecar) or run
+`goose update`. The packaged
+updater uses the ViaTech release channel and fails closed unless the downloaded
+archive has valid Sigstore/SLSA provenance.
+
+## ViaTech terminal controls
+
+The fork's interactive CLI adds coding-session controls directly to goose:
+
+- `/model` and `/think` switch models and reasoning effort; `Shift+Tab` cycles
+  the supported reasoning levels without losing the draft.
+- `/permissions`, `/pwd`, and `/cd` expose approval and workspace state. An
+  ExactCode-governed session cannot use `/cd` or symlinks to escape its
+  authorized workspace.
+- `/new`, `/resume`, `/fork`, `/rename`, and `/sessions` manage durable sessions;
+  `/diff`, `/review`, `/goal`, `/queue`, and `/status` expose coding workflow
+  state.
+- `/image` queues validated PNG, JPEG, or WebP attachments for the next turn;
+  `/images` inspects or clears them.
+- `/subagents`, `/agent`, `/ps`, and `/stop` manage governed parallel work and
+  background processes.
+- While a response streams, `Enter` steers the active turn and `Tab` queues a
+  distinct next turn. `Ctrl+J` inserts a newline, and `/edit` opens the prompt
+  editor.
+
+See the [CLI command guide](https://goose-docs.ai/docs/guides/goose-cli-commands#interactive-session-features)
+for command arguments, limits, and key behavior.
 
 # Quick links
 - [Quickstart](https://goose-docs.ai/docs/quickstart)

@@ -12,6 +12,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const RELEASE_REPOSITORY: &str = "ViaTechSystems/goose";
+
+fn attestation_url(digest: &str) -> String {
+    format!(
+        "https://api.github.com/repos/{RELEASE_REPOSITORY}/attestations/sha256:{digest}?per_page=30&predicate_type=https://slsa.dev/provenance/v1"
+    )
+}
+
+fn release_asset_url(tag: &str, asset: &str) -> String {
+    format!("https://github.com/{RELEASE_REPOSITORY}/releases/download/{tag}/{asset}")
+}
+
 /// Asset name for this platform (compile-time).
 fn asset_name() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -110,10 +122,7 @@ fn should_retry_attestations_without_token(status: StatusCode, token: Option<&st
 }
 
 async fn fetch_attestations(digest: &str, token: Option<&str>) -> Result<Vec<serde_json::Value>> {
-    let url = format!(
-        "https://api.github.com/repos/aaif-goose/goose/attestations/sha256:{digest}\
-         ?per_page=30&predicate_type=https://slsa.dev/provenance/v1"
-    );
+    let url = attestation_url(digest);
 
     let client = reqwest::Client::new();
     let token = sanitized_token(token);
@@ -256,7 +265,7 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
     {
         let tag = if canary { "canary" } else { "stable" };
         let asset = asset_name();
-        let url = format!("https://github.com/aaif-goose/goose/releases/download/{tag}/{asset}");
+        let url = release_asset_url(tag, asset);
 
         println!("Downloading {asset} from {tag} release...");
 
@@ -602,6 +611,20 @@ mod tests {
         assert_eq!(name, "goose.exe");
         #[cfg(not(target_os = "windows"))]
         assert_eq!(name, "goose");
+    }
+
+    #[test]
+    fn update_channel_is_pinned_to_the_viatech_fork() {
+        assert_eq!(RELEASE_REPOSITORY, "ViaTechSystems/goose");
+        assert_eq!(
+            release_asset_url("stable", "goose-test.tar.bz2"),
+            "https://github.com/ViaTechSystems/goose/releases/download/stable/goose-test.tar.bz2"
+        );
+        let url = attestation_url("abc123");
+        assert!(url.starts_with(
+            "https://api.github.com/repos/ViaTechSystems/goose/attestations/sha256:abc123"
+        ));
+        assert!(!url.contains("aaif-goose"));
     }
 
     #[test]

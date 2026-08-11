@@ -77,6 +77,14 @@ goose --version
 #### update [options]
 Update the goose CLI to a newer version.
 
+:::warning ViaTech fork
+The minimal ViaTech source build in the installation guide does not include this
+command; update that build by rerunning its Cargo command. Packaged ViaTech
+builds use the ViaTech `stable` or `canary` channel and require valid
+Sigstore/SLSA provenance before replacing the executable. See
+[Updating goose](/docs/guides/updating-goose) for both workflows.
+:::
+
 **Options:**
 - **`--canary, -c`**: Update to the canary (development) version instead of the stable version
 - **`--reconfigure, -r`**: Forces goose to reset configuration settings during the update process
@@ -810,10 +818,11 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 - **`/diff`**, **`/review [instructions]`** - Inspect or review repository changes
 - **`/goal ...`** - Create, edit, pause, resume, inspect, or clear a proof-bound durable goal
 - **`/queue [message|clear]`** - Add, inspect, or clear next-turn guidance
-- **`/image <path...>`**, **`/images [clear]`** - Queue, inspect, or clear images for the next turn
+- **`/image <path...>`**, **`/images [clear]`** - Queue, inspect, or clear PNG, JPEG, or WebP images for the next turn. Each turn accepts up to four images, 10 MiB each and 20 MiB combined; governed sessions also confine paths (including symlink targets) to the authorized workspace
 - **`/ps`**, **`/stop <process-id>`** - Inspect or stop governed background processes
 - **`/subagents`** (alias **`/agents`**), **`/agent <task>`**, **`/agent stop <id>`** - Inspect, start, or stop Summon subagents
-- **`/status`**, **`/edit`** - Inspect session state or edit conversation history
+- **`/status`** - Inspect the current model, provider, mode, and token usage
+- **`/edit [text]`** - Open the configured prompt editor to compose a message, optionally pre-filled with text
 
 **Examples:**
 ```bash
@@ -831,6 +840,14 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 
 # Clear the current conversation history
 /clear
+
+# Switch model and reasoning effort without leaving the session
+/model
+/think high
+
+# Attach an image to the next message, then inspect the pending attachment
+/image ./screenshots/failure.png
+/images
 ```
 You can also create [custom slash commands for running recipes](/docs/guides/context-engineering/slash-commands) in goose Desktop or the CLI. 
 

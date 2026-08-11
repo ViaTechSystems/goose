@@ -18,6 +18,13 @@ env:
   # > Actions > Variables after a release containing desktop app-update.yml has shipped.
   ENABLE_MAC_NATIVE_AUTO_UPDATE: ${{ vars.ENABLE_MAC_NATIVE_AUTO_UPDATE || 'false' }}
 
+# Tagged releases are unsigned by default so a fork can publish CLI and desktop
+# artifacts before it has platform-signing credentials. Set the repository
+# Actions variable ENABLE_RELEASE_SIGNING to the exact string "true" only after
+# the `signing` environment and its Apple/Azure secrets are configured. Keep the
+# tag check as well: release/* branches are build-only preflights and must not
+# consume signing credentials.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -53,8 +60,8 @@ jobs:
       target: aarch64-apple-darwin
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') }}
-      environment: ${{ startsWith(github.ref, 'refs/tags/') && 'signing' || '' }}
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
+      environment: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' && 'signing' || '' }}
     secrets: inherit
 
   # ------------------------------------------------------------
@@ -68,8 +75,8 @@ jobs:
       target: x86_64-apple-darwin
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') }}
-      environment: ${{ startsWith(github.ref, 'refs/tags/') && 'signing' || '' }}
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
+      environment: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' && 'signing' || '' }}
     secrets: inherit
 
   # ------------------------------------------------------------
@@ -89,8 +96,8 @@ jobs:
     with:
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') }}
-      environment: ${{ startsWith(github.ref, 'refs/tags/') && 'signing' || '' }}
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
+      environment: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' && 'signing' || '' }}
     secrets: inherit
 
   bundle-windows-cuda:
@@ -101,8 +108,8 @@ jobs:
     with:
       package_cli: true
       package_desktop: true
-      signing: ${{ startsWith(github.ref, 'refs/tags/') }}
-      environment: ${{ startsWith(github.ref, 'refs/tags/') && 'signing' || '' }}
+      signing: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' }}
+      environment: ${{ startsWith(github.ref, 'refs/tags/') && vars.ENABLE_RELEASE_SIGNING == 'true' && 'signing' || '' }}
       windows_variant: cuda
     secrets: inherit
 

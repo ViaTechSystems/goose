@@ -4,172 +4,128 @@ title: Updating goose
 sidebar_label: Updating goose
 ---
 
-import Tabs from '@theme/Tabs';
-import TabItem from '@theme/TabItem';
 import { DesktopAutoUpdateSteps } from '@site/src/components/DesktopAutoUpdateSteps';
 import MacDesktopInstallButtons from '@site/src/components/MacDesktopInstallButtons';
 import WindowsDesktopInstallButtons from '@site/src/components/WindowsDesktopInstallButtons';
 import LinuxDesktopInstallButtons from '@site/src/components/LinuxDesktopInstallButtons';
 
-The goose CLI and desktop apps are under active and continuous development. To get the newest features and fixes, you should periodically update your goose client using the following instructions.
+# Updating goose
 
-:::note ViaTech fork release status
-Until the first checksum-backed ViaTech binary release is published, the CLI
-source-install commands below are authoritative for this fork. Desktop update
-controls and `goose update` target upstream distribution channels and do not
-install the ViaTech session controls.
+## ViaTech CLI
+
+:::warning Use the ViaTech release channel
+The ViaTech CLI does not update itself in the background. The minimal source
+build below does not include `goose update`; packaged ViaTech builds do, and
+their updater is pinned to the ViaTech release channel. Upstream package
+managers and desktop downloads remain separate distribution channels.
 :::
 
-<Tabs>
-  <TabItem value="mac" label="macOS" default>
-    <Tabs groupId="interface">
-      <TabItem value="ui" label="goose Desktop" default>
-        Update goose to the latest stable version.
+### Source installs made before the first binary release
 
-        <DesktopAutoUpdateSteps />
-        
-        **To manually download and install updates:**
-        1. <MacDesktopInstallButtons/>
-        2. Unzip the downloaded zip file
-        3. Drag the extracted `Goose.app` file to the `Applications` folder to overwrite your current version
-        4. Launch goose Desktop
+If you installed from source before `stable` appeared on the
+[ViaTech releases page](https://github.com/ViaTechSystems/goose/releases),
+update by rerunning the same Cargo command used to install it:
 
-      </TabItem>
-      <TabItem value="cli" label="goose CLI">
-        You can update goose by running:
+```bash
+cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli \
+  --locked --no-default-features --features rustls-tls,code-mode
+goose --version
+```
 
-        ```sh
-        goose update
-        ```
+This requires Rust/Cargo and follows the current ViaTech branch. For a
+reproducible source build, add `--rev <full-commit-sha>` before `goose-cli`.
 
-        Additional [options](/docs/guides/goose-cli-commands#update-options):
-        
-        ```sh
-        # Update to latest canary (development) version
-        goose update --canary
+### Packaged installs from the `stable` release
 
-        # Update and reconfigure settings
-        goose update --reconfigure
-        ```
+Rerun the ViaTech installer to install or update:
 
-        Or you can run the [installation](/docs/getting-started/installation) script again:
+```bash
+curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
+goose --version
+```
 
-        ```sh
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
-        ```
+The installer supports macOS, Linux, WSL, Android/Termux, Git Bash, and MSYS2.
+It downloads from `ViaTechSystems/goose`, requires a one-line SHA-256 sidecar
+naming the exact archive, and verifies the archive before extraction. A
+missing, malformed, or mismatched checksum stops the install. Native PowerShell
+does not yet have a checksum-backed ViaTech installer; use the Cargo command
+there.
 
-        To check your current goose version, use the following command:
+To pin an already-published release for CI or reproducible local installs:
 
-        ```sh
-        goose --version
-        ```
-      </TabItem>
-    </Tabs>
-  </TabItem>
+```bash
+GOOSE_VERSION=vX.Y.Z CONFIGURE=false \
+  curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
+```
 
-  <TabItem value="linux" label="Linux">
-    <Tabs groupId="interface">
-      <TabItem value="ui" label="goose Desktop" default>
-        Update goose to the latest stable version.
+`GOOSE_BIN_DIR` changes the destination. The default is `~/.local/bin` on
+macOS/Linux/WSL and `%USERPROFILE%\\goose` in Git Bash or MSYS2 on native
+Windows.
 
-        <DesktopAutoUpdateSteps />
-        
-        **To manually download and install updates:**
-        1. <LinuxDesktopInstallButtons/>
+A packaged ViaTech build can instead update itself on demand:
 
-        #### For Debian/Ubuntu-based distributions
-        2. In a terminal, navigate to the downloaded DEB file
-        3. Run `sudo dpkg -i (filename).deb`
-        4. Launch goose from the app menu
-      </TabItem>
-      <TabItem value="cli" label="goose CLI">
-        You can update goose by running:
+```bash
+# Latest stable ViaTech release
+goose update
 
-        ```sh
-        goose update
-        ```
+# Latest ViaTech canary release
+goose update --canary
 
-        Additional [options](/docs/guides/goose-cli-commands#update-options):
-        
-        ```sh
-        # Update to latest canary (development) version
-        goose update --canary
+# Re-run configuration after a verified update
+goose update --reconfigure
+```
 
-        # Update and reconfigure settings
-        goose update --reconfigure
-        ```
+This is a foreground command, not an automatic update. It downloads the
+platform archive from `ViaTechSystems/goose` and refuses to replace the current
+executable unless the archive passes Sigstore/SLSA provenance verification.
 
-        Or you can run the [installation](/docs/getting-started/installation) script again:
+### Fresh CLI reinstall
 
-        ```sh
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
-        ```
+A reinstall normally needs to replace only the executable. It does not require
+deleting sessions, configuration, or secrets.
 
-        To check your current goose version, use the following command:
+For a Cargo installation:
 
-        ```sh
-        goose --version
-        ```
-      </TabItem>
-    </Tabs>
-  </TabItem>
+```bash
+cargo uninstall goose-cli
+cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli \
+  --locked --no-default-features --features rustls-tls,code-mode
+```
 
-  <TabItem value="windows" label="Windows">
-    <Tabs groupId="interface">
-      <TabItem value="ui" label="goose Desktop" default>
-        Update goose to the latest stable version.
+For a checksum-installer installation, remove the old executable from the
+installer destination and rerun the installer. With the Unix default:
 
-        <DesktopAutoUpdateSteps />
-        
-        **To manually download and install updates:**
-        1. <WindowsDesktopInstallButtons/>
-        2. Unzip the downloaded zip file
-        3. Run the executable file to launch the goose Desktop app
-      </TabItem>
-      <TabItem value="cli" label="goose CLI">
-        You can update goose by running:
+```bash
+rm -f "$HOME/.local/bin/goose"
+curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
+```
 
-        ```sh
-        goose update
-        ```
+If you used `GOOSE_BIN_DIR`, remove only `goose` (or `goose.exe`) from that
+exact directory. See [Uninstall goose or remove cached data](/docs/troubleshooting/known-issues#uninstall-goose-or-remove-cached-data)
+only when you deliberately want to erase local state as well.
 
-        Additional [options](/docs/guides/goose-cli-commands#update-options):
-        
-        ```sh
-        # Update to latest canary (development) version
-        goose update --canary
+## Upstream desktop app
 
-        # Update and reconfigure settings
-        goose update --reconfigure
-        ```
+The desktop downloads currently remain upstream AAIF builds and do not include
+the ViaTech terminal coding-session controls. Their update UI is separate from
+the ViaTech CLI and does not update a CLI installation.
 
-        Or you can run the [installation](/docs/getting-started/installation) script again in **Git Bash**, **MSYS2**, or **PowerShell** to update the goose CLI natively on Windows:
+### Automatic update setting
 
-        ```bash
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
-        ```
-        
-        To check your current goose version, use the following command:
+<DesktopAutoUpdateSteps />
 
-        ```sh
-        goose --version
-        ```        
+### Manual desktop update
 
-        <details>
-        <summary>Update via Windows Subsystem for Linux (WSL)</summary>
+- **macOS:** Download with <MacDesktopInstallButtons/>, unzip it, and replace
+  `Goose.app` in `Applications`.
+- **Linux:** Download with <LinuxDesktopInstallButtons/>. On Debian or Ubuntu,
+  install the downloaded package with `sudo dpkg -i <filename>.deb`.
+- **Windows:** Download with <WindowsDesktopInstallButtons/>, unzip it, and run
+  the executable.
 
-        To update your WSL installation, use `goose update` or run the installation script again via WSL:
-
-        ```sh
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
-        ```
-
-       </details>
-      </TabItem>
-    </Tabs>
-  </TabItem>
-</Tabs>
-
-:::info Updating in CI/CD
-If you're running goose in CI or other non-interactive environments, pin a specific version with `GOOSE_VERSION` for reproducible installs. See [CI/CD Environments](/docs/tutorials/cicd) for a complete example and usage details.
+:::info CI/CD
+Before the first binary release, pin a full Git commit with Cargo. After the
+release, set `GOOSE_VERSION` and use the checksum-backed installer. See
+[CI/CD Environments](/docs/tutorials/cicd) for additional non-interactive
+setup guidance.
 :::

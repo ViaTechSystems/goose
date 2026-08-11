@@ -148,6 +148,38 @@ This warning helps protect against inadvertently executing potentially harmful r
 
 You may need to uninstall goose or clear existing data before re-installing. goose stores data in different locations depending on your operating system. Secrets, such as API keys, are stored in the system keychain/keyring by default (or in `secrets.yaml` when file-based secret storage is in use).
 
+#### Remove or reinstall only the ViaTech CLI
+
+Removing the CLI executable does not remove saved sessions, configuration, or
+secrets. For a Cargo source installation:
+
+```bash
+cargo uninstall goose-cli
+```
+
+To reinstall the current ViaTech source:
+
+```bash
+cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli \
+  --locked --no-default-features --features rustls-tls,code-mode
+```
+
+An installation made by the checksum-backed ViaTech `stable` shell installer
+can be refreshed by removing only `goose` from its installer destination and
+rerunning the verified installer. The Unix default is
+`$HOME/.local/bin/goose`; native Windows under Git Bash or MSYS2 defaults to
+`$USERPROFILE/goose/goose.exe`. If you set `GOOSE_BIN_DIR`, use that exact
+directory instead.
+
+```bash
+rm -f "$HOME/.local/bin/goose"
+curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
+```
+
+See [Updating goose](/docs/guides/updating-goose) for release-status,
+checksum, and platform details. Continue below only if you intentionally want
+to erase local data as well; that cleanup is separate and irreversible.
+
 #### macOS
 
 **Data Locations**

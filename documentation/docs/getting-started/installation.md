@@ -13,11 +13,39 @@ import { PanelLeft } from 'lucide-react';
 
 # Install goose
 
-:::note ViaTech fork release status
-The first checksum-backed ViaTech binary release has not been published yet.
-The CLI commands below install the current fork from source with Cargo; they do
-not install the upstream AAIF binary. Desktop downloads remain upstream builds
-and do not include the ViaTech coding-session controls.
+:::note ViaTech CLI and upstream desktop
+The checksum-backed installer below is the standard ViaTech CLI path after a
+`stable` release appears. If that release is not visible yet, use the documented
+Cargo fallback. Both paths install the ViaTech fork, not the upstream AAIF
+binary. Desktop downloads remain upstream builds and do not include the ViaTech
+coding-session controls.
+:::
+
+## ViaTech CLI release installer
+
+Install or update from the `stable` channel with:
+
+```bash
+curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
+```
+
+The installer supports macOS, Linux, WSL, Android/Termux, Git Bash, and MSYS2.
+It downloads only from `ViaTechSystems/goose`, requires a one-line SHA-256
+sidecar naming the exact archive, verifies the archive before extraction, and
+preserves the previous Unix binary if replacement fails. Set `CONFIGURE=false`
+for a non-interactive install, `GOOSE_BIN_DIR` for a custom destination, or
+`GOOSE_VERSION=vX.Y.Z` to pin a published release. Native PowerShell does not
+yet have a checksum-backed ViaTech installer; use the Cargo command in the
+Windows tab. If `stable` is not visible on the
+[ViaTech releases page](https://github.com/ViaTechSystems/goose/releases) yet,
+use the same Cargo fallback.
+
+:::warning Updating the ViaTech CLI
+The CLI does not update itself in the background. The minimal source build
+documented below does not include `goose update`, so rerun the Cargo command to
+update it. After the ViaTech `stable` release exists, a packaged ViaTech build
+can run `goose update`; it uses the ViaTech release channel and requires valid
+Sigstore/SLSA provenance. You can also rerun the checksum-backed installer.
 :::
 
 <Tabs>
@@ -56,31 +84,18 @@ and do not include the ViaTech coding-session controls.
         </div>
       </TabItem>
       <TabItem value="cli" label="goose CLI">
-        Install goose directly from the browser or with [Homebrew](https://brew.sh/).
-
-        <h3 style={{ marginTop: '1rem' }}>Option 1: Install via Download script</h3>
-        Run the following command to install the latest version of goose on macOS:
-
-        ```sh
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
-        ```
-        This script will fetch the latest version of goose and set it up on your system.
-
-        If you'd like to install without interactive configuration, disable `CONFIGURE`:
+        <h3 style={{ marginTop: '1rem' }}>Install the ViaTech CLI</h3>
+        Use the checksum-backed release installer shown above. If `stable` is
+        not published yet, install the current source with:
 
         ```sh
         cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
+        This requires a Rust toolchain and installs `goose` in Cargo's binary
+        directory (normally `~/.cargo/bin`). Rerun the same command to update.
 
-        :::tip Updating goose
-        It's best to keep goose updated. To update goose, run:
-        ```sh
-        goose update
-        ```
-        :::
-
-        <h3>Option 2: Install via Homebrew</h3>
-        Homebrew downloads the [a precompiled CLI tool](https://github.com/Homebrew/homebrew-core/blob/master/Formula/b/block-goose-cli.rb) and can take care of updates.
+        <h3>Upstream alternative: Homebrew</h3>
+        Homebrew downloads [a precompiled upstream CLI tool](https://github.com/Homebrew/homebrew-core/blob/master/Formula/b/block-goose-cli.rb) and can take care of updates.
         ```bash
         brew install block-goose-cli
         ```
@@ -111,25 +126,14 @@ and do not include the ViaTech coding-session controls.
         </div>
       </TabItem>
       <TabItem value="cli" label="goose CLI">
-        Run the following command to install the goose CLI on Linux:
+        Use the checksum-backed release installer shown above. If `stable` is
+        not published yet, install the current source with:
 
         ```sh
         cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
-        This script will fetch the latest version of goose and set it up on your system.
-
-        If you'd like to install without interactive configuration, disable `CONFIGURE`:
-
-        ```sh
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
-        ```
-
-        :::tip Updating goose
-        It's best to keep goose updated. To update goose, run:
-        ```sh
-        goose update
-        ```
-        :::
+        This requires a Rust toolchain and installs `goose` in Cargo's binary
+        directory (normally `~/.cargo/bin`). Rerun the same command to update.
       </TabItem>
     </Tabs>
   </TabItem>
@@ -159,28 +163,22 @@ and do not include the ViaTech coding-session controls.
         - **MSYS2**: Available from [msys2.org](https://www.msys2.org/)
         - **PowerShell**: Available on Windows 10/11 by default
 
-        **Git Bash / MSYS2: Standard**
+        **Native PowerShell or pre-release fallback (all shells)**
 
         ```bash
         cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
-        To install without interactive configuration, disable `CONFIGURE`:
+        This source installation requires Rust/Cargo. Cargo normally installs
+        the executable in `%USERPROFILE%\.cargo\bin`; ensure that directory is
+        on `PATH`.
 
-        ```bash
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
-        ```
+        **Checksum-backed release install (Git Bash / MSYS2)**
 
-        **PowerShell Installation: Standard**
-        Download the PowerShell installation script to your current directory.
-
-        ```powershell
-        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode;
-        ```
-        Then run the script to install goose:
-        ```powershell
-        .\download_cli.ps1
-        ```
+        Use the checksum-backed shell installer shown above. Its default native
+        Windows destination is `%USERPROFILE%\goose`; add that directory to
+        `PATH`. A ViaTech PowerShell installer is not published yet, so
+        PowerShell-only users should continue using Cargo.
 
         :::info Windows PATH Setup
         If you see a warning that goose is not in your PATH, you need to add goose to your PATH:
@@ -188,7 +186,7 @@ and do not include the ViaTech coding-session controls.
         <details>
           <summary>For Git Bash/MSYS2</summary>
           ```bash
-          echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+          echo 'export PATH="$USERPROFILE/goose:$HOME/.cargo/bin:$PATH"' >> ~/.bashrc
           source ~/.bashrc
           ```
         </details>
@@ -199,7 +197,7 @@ and do not include the ViaTech coding-session controls.
           # Add to your PowerShell profile
           $profilePath = $PROFILE
           if (!(Test-Path $profilePath)) { New-Item -Path $profilePath -ItemType File -Force }
-          Add-Content -Path $profilePath -Value '$env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"'
+          Add-Content -Path $profilePath -Value '$env:PATH = "$env:USERPROFILE\goose;$env:USERPROFILE\.cargo\bin;$env:PATH"'
           # Reload profile or restart PowerShell
           . $PROFILE
           ```
@@ -225,9 +223,9 @@ and do not include the ViaTech coding-session controls.
           wsl -d Ubuntu
           ```
 
-          3. Run the goose installation script:
+          3. Use the checksum-backed Linux installer:
           ```bash
-          cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
+          curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
           ```
           :::tip
             If you encounter any issues on download, you might need to install `bzip2` to extract the downloaded file:
@@ -237,7 +235,7 @@ and do not include the ViaTech coding-session controls.
             ```
           :::
 
-          If you'd like to install without interactive configuration, disable `CONFIGURE`:
+          If `stable` is not visible yet, install the current source instead:
 
           ```sh
           cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
@@ -247,7 +245,6 @@ and do not include the ViaTech coding-session controls.
 
           ```
           echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-          echo 'export OPENAI_API_KEY=your_api_key' >> ~/.bashrc
           source ~/.bashrc
           ```
 
