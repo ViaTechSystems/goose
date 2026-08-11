@@ -184,6 +184,23 @@ impl fmt::Display for GoosePlatform {
     }
 }
 
+/// Load an additive system-prompt fragment configured by an embedding client.
+///
+/// This intentionally differs from `GOOSE_SYSTEM_PROMPT_FILE_PATH`, which
+/// replaces Goose's core prompt. Embedders such as ExactCode need to add their
+/// governed instruction hierarchy while preserving Goose's tool and safety
+/// instructions.
+pub fn configured_additional_system_prompt(config: &Config) -> Result<Option<String>> {
+    let path: Option<String> = config
+        .get_param("GOOSE_ADDITIONAL_SYSTEM_PROMPT_FILE_PATH")
+        .ok();
+    path.map(|path| {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("reading additional system prompt file '{path}'"))
+    })
+    .transpose()
+}
+
 #[derive(Clone)]
 pub struct AgentConfig {
     pub session_manager: Arc<SessionManager>,

@@ -445,7 +445,7 @@ impl OpenAiProvider {
             ThinkingEffort::Off | ThinkingEffort::Low => "low",
             ThinkingEffort::Medium => "medium",
             ThinkingEffort::High => "high",
-            ThinkingEffort::Max => "xhigh",
+            ThinkingEffort::XHigh | ThinkingEffort::Max => "xhigh",
         }
     }
 

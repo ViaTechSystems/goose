@@ -166,6 +166,10 @@ impl GooseCompleter {
                 let candidates: Vec<Pair> = cache
                     .provider_names
                     .iter()
+                    .filter(|name| {
+                        std::env::var("EXACTCODE_GOVERNED_SESSION").as_deref() != Ok("1")
+                            || name.as_str() == "openai"
+                    })
                     .filter(|name| name.starts_with(partial))
                     .map(|name| Pair {
                         display: name.clone(),
@@ -212,7 +216,7 @@ impl GooseCompleter {
 
     fn complete_thinking_effort(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
         let partial = line.strip_prefix("/think").unwrap_or("").trim_start();
-        let efforts = ["off", "low", "medium", "high", "max"];
+        let efforts = ["off", "low", "medium", "high", "xhigh", "max"];
         Ok((
             line.len() - partial.len(),
             efforts
@@ -274,6 +278,30 @@ impl GooseCompleter {
         ))
     }
 
+    fn complete_rewind_action(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let trailing_space = line.ends_with(' ');
+        if parts.len() < 2 || parts.len() > 3 || (parts.len() == 2 && !trailing_space) {
+            return Ok((line.len(), Vec::new()));
+        }
+        let partial = if parts.len() == 3 && !trailing_space {
+            parts[2]
+        } else {
+            ""
+        };
+        Ok((
+            line.len() - partial.len(),
+            ["conversation", "code", "both", "fork"]
+                .into_iter()
+                .filter(|action| action.starts_with(partial))
+                .map(|action| Pair {
+                    display: action.to_string(),
+                    replacement: action.to_string(),
+                })
+                .collect(),
+        ))
+    }
+
     fn models_completion_from_cache(
         &self,
         provider_name: &str,
@@ -322,6 +350,7 @@ impl GooseCompleter {
             "/sessions".to_string(),
             "/diff".to_string(),
             "/review".to_string(),
+            "/rewind".to_string(),
             "/queue".to_string(),
             "/ps".to_string(),
             "/stop".to_string(),
@@ -580,6 +609,10 @@ impl Completer for GooseCompleter {
 
             if line.starts_with("/permissions") {
                 return self.complete_permission_policy(line);
+            }
+
+            if line.starts_with("/rewind") {
+                return self.complete_rewind_action(line);
             }
 
             if let Some(path) = line.strip_prefix("/image ") {
@@ -841,6 +874,7 @@ mod tests {
             "/sessions",
             "/diff",
             "/review",
+            "/rewind",
             "/queue",
             "/permissions",
             "/ps",
@@ -871,6 +905,28 @@ mod tests {
 
         let (_, candidates) = completer.complete_session_selector("/resume 019").unwrap();
         assert_eq!(candidates[0].replacement, "019abc-session-id");
+    }
+
+    #[test]
+    fn completes_rewind_restore_scope() {
+        let completer = GooseCompleter::new(create_test_cache());
+        let (position, candidates) = completer
+            .complete_rewind_action("/rewind checkpoint-1 ")
+            .unwrap();
+        assert_eq!(position, "/rewind checkpoint-1 ".len());
+        assert_eq!(candidates.len(), 4);
+
+        let (position, candidates) = completer
+            .complete_rewind_action("/rewind checkpoint-1 co")
+            .unwrap();
+        assert_eq!(position, "/rewind checkpoint-1 ".len());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.replacement.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conversation", "code"]
+        );
     }
 
     #[test]
@@ -921,7 +977,7 @@ mod tests {
 
         let (pos, candidates) = completer.complete_thinking_effort("/think ").unwrap();
         assert_eq!(pos, "/think ".len());
-        assert_eq!(candidates.len(), 5);
+        assert_eq!(candidates.len(), 6);
 
         let (pos, candidates) = completer.complete_thinking_effort("/think m").unwrap();
         assert_eq!(pos, "/think ".len());
@@ -932,6 +988,10 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.display == "max"));
+
+        let (_, candidates) = completer.complete_thinking_effort("/think x").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "xhigh");
     }
 
     #[test]

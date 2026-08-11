@@ -46,7 +46,8 @@ goose --version
 
 The installer supports macOS, Linux, WSL, Android/Termux, Git Bash, and MSYS2.
 It downloads from `ViaTechSystems/goose`, requires a one-line SHA-256 sidecar
-naming the exact archive, and verifies the archive before extraction. A
+naming the exact archive, stages in a private directory, validates archive
+members and size limits, and verifies the archive before extraction. A
 missing, malformed, or mismatched checksum stops the install. Native PowerShell
 does not yet have a checksum-backed ViaTech installer; use the Cargo command
 there.
@@ -78,6 +79,9 @@ goose update --reconfigure
 This is a foreground command, not an automatic update. It downloads the
 platform archive from `ViaTechSystems/goose` and refuses to replace the current
 executable unless the archive passes Sigstore/SLSA provenance verification.
+The replacement is staged beside the installed executable and committed as an
+atomic rename on Unix. Native Windows uses a destination lock and a rollback
+transaction for the executable and runtime DLLs.
 
 ### Fresh CLI reinstall
 

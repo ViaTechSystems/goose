@@ -19,6 +19,53 @@ use std::path::Path;
 const MAX_EXTENSIONS: usize = 5;
 const MAX_TOOLS: usize = 50;
 
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.get(..end).unwrap_or_default().to_string()
+}
+
+fn apply_context_total_budget(
+    extras: &mut IndexMap<String, String>,
+    hints: Option<String>,
+    max_bytes: Option<usize>,
+) {
+    let configured = extras.shift_remove("configured-additional");
+    let subdirectory: Vec<(String, String)> = extras
+        .extract_if(.., |key, _| key.starts_with("subdir_hints:"))
+        .collect();
+    let mut ordered = Vec::new();
+    if let Some(value) = configured {
+        ordered.push(("configured-additional".to_string(), value));
+    }
+    if let Some(value) = hints {
+        ordered.push(("hints".to_string(), value));
+    }
+    ordered.extend(subdirectory);
+
+    let mut remaining = max_bytes.unwrap_or(usize::MAX);
+    for (key, value) in ordered {
+        if remaining == 0 {
+            break;
+        }
+        let was_truncated = value.len() > remaining;
+        let value = truncate_utf8_bytes(&value, remaining);
+        remaining = if was_truncated {
+            0
+        } else {
+            remaining.saturating_sub(value.len())
+        };
+        if !value.is_empty() {
+            extras.insert(key, value);
+        }
+    }
+}
+
 pub struct PromptManager {
     system_prompt_override: Option<String>,
     system_prompt_extras: IndexMap<String, String>,
@@ -187,10 +234,14 @@ impl<'a> SystemPromptBuilder<'a, PromptManager> {
         let mut system_prompt_extras = self.manager.system_prompt_extras.clone();
         system_prompt_extras.extend(self.prompt_extras);
 
-        // Add hints if provided
-        if let Some(hints) = self.hints {
-            system_prompt_extras.insert("hints".to_string(), hints);
-        }
+        // Keep embedding-client global guidance, project/root hints, and
+        // discovered subdirectory hints in increasing precedence while
+        // enforcing one deterministic aggregate byte budget. The byte-safe
+        // truncation never splits a UTF-8 code point.
+        let context_total_bytes = Config::global()
+            .get_param::<usize>("CONTEXT_TOTAL_BYTES")
+            .ok();
+        apply_context_total_budget(&mut system_prompt_extras, self.hints, context_total_bytes);
 
         if goose_mode == GooseMode::Chat {
             system_prompt_extras.insert(
@@ -317,6 +368,26 @@ impl PromptManager {
 #[cfg(test)]
 mod tests {
     use insta::assert_snapshot;
+
+    #[test]
+    fn context_budget_is_aggregate_ordered_and_utf8_safe() {
+        let mut extras = IndexMap::new();
+        extras.insert("unrelated".to_string(), "keep me".to_string());
+        extras.insert("configured-additional".to_string(), "global".to_string());
+        extras.insert("subdir_hints:/repo/src".to_string(), "nested".to_string());
+
+        apply_context_total_budget(&mut extras, Some("root💡".to_string()), Some(12));
+
+        assert_eq!(extras.get("unrelated").map(String::as_str), Some("keep me"));
+        assert_eq!(
+            extras.get("configured-additional").map(String::as_str),
+            Some("global")
+        );
+        // Six bytes remain after "global". "root💡" is eight bytes, so the
+        // lightbulb is dropped whole rather than emitting invalid UTF-8.
+        assert_eq!(extras.get("hints").map(String::as_str), Some("root"));
+        assert!(!extras.contains_key("subdir_hints:/repo/src"));
+    }
 
     use super::*;
 

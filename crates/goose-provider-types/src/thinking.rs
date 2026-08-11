@@ -279,6 +279,7 @@ pub enum ThinkingEffort {
     Low,
     Medium,
     High,
+    XHigh,
     Max,
 }
 
@@ -290,7 +291,8 @@ impl FromStr for ThinkingEffort {
             "low" => Ok(Self::Low),
             "medium" | "med" => Ok(Self::Medium),
             "high" => Ok(Self::High),
-            "max" | "xhigh" => Ok(Self::Max),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
             other => Err(format!("unknown thinking effort: '{other}'")),
         }
     }
@@ -303,6 +305,7 @@ impl fmt::Display for ThinkingEffort {
             Self::Low => write!(f, "low"),
             Self::Medium => write!(f, "medium"),
             Self::High => write!(f, "high"),
+            Self::XHigh => write!(f, "xhigh"),
             Self::Max => write!(f, "max"),
         }
     }
@@ -311,6 +314,24 @@ impl fmt::Display for ThinkingEffort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_effort_keeps_xhigh_and_max_distinct_and_serde_compatible() {
+        assert_eq!("xhigh".parse(), Ok(ThinkingEffort::XHigh));
+        assert_eq!("max".parse(), Ok(ThinkingEffort::Max));
+        assert_eq!(
+            serde_json::from_str::<ThinkingEffort>(r#""max""#).unwrap(),
+            ThinkingEffort::Max
+        );
+        assert_eq!(
+            serde_json::from_str::<ThinkingEffort>(r#""xhigh""#).unwrap(),
+            ThinkingEffort::XHigh
+        );
+        assert_eq!(
+            serde_json::to_string(&ThinkingEffort::Max).unwrap(),
+            r#""max""#
+        );
+    }
 
     #[test]
     fn test_split_think_blocks_extracts_inline_reasoning() {

@@ -39,6 +39,7 @@ pub enum InputResult {
     ListSessions,
     Diff,
     Review(Option<String>),
+    Rewind(RewindCommandOptions),
     Queue(Option<String>),
     ProcessList,
     StopProcess(String),
@@ -90,6 +91,12 @@ pub struct PlanCommandOptions {
 pub struct ModelCommandOptions {
     pub provider: Option<String>,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct RewindCommandOptions {
+    pub selector: Option<String>,
+    pub action: Option<String>,
 }
 
 struct CtrlCHandler {
@@ -302,6 +309,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_FORK: &str = "/fork";
     const CMD_RENAME: &str = "/rename";
     const CMD_REVIEW: &str = "/review";
+    const CMD_REWIND: &str = "/rewind";
     const CMD_QUEUE: &str = "/queue";
     const CMD_STOP: &str = "/stop";
     const CMD_AGENT: &str = "/agent";
@@ -454,6 +462,19 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s.starts_with("/review ") => Some(InputResult::Review(parse_optional_text(
             s.strip_prefix("/review ").unwrap_or_default(),
         ))),
+        s if s == CMD_REWIND => Some(InputResult::Rewind(RewindCommandOptions::default())),
+        s if s.starts_with("/rewind ") => {
+            let parts =
+                shlex::split(s.strip_prefix("/rewind ").unwrap_or_default()).unwrap_or_default();
+            Some(InputResult::Rewind(RewindCommandOptions {
+                selector: parts.first().cloned(),
+                action: if parts.len() > 1 {
+                    Some(parts[1..].join(" "))
+                } else {
+                    None
+                },
+            }))
+        }
         s if s == CMD_QUEUE => Some(InputResult::Queue(None)),
         s if s.starts_with("/queue ") => Some(InputResult::Queue(parse_optional_text(
             s.strip_prefix("/queue ").unwrap_or_default(),
@@ -624,7 +645,7 @@ fn help_text() -> String {
 /permissions [ask|accept-edit|no-perms|read-only] - Show or change this session's approval policy
 /model [name] - Open the model picker, or switch directly by name for this session
 /model --provider <name> [model] - Switch to a different provider (optionally specifying a model)
-/think [off|low|medium|high|max] - Show or set reasoning effort for this session
+/think [off|low|medium|high|xhigh|max] - Show or set reasoning effort for this session
 /image <path> [path ...] - Attach up to four PNG, JPEG, or WebP files to the next message
 /images [clear] - List or clear images attached to the next message
 /cd [directory] - Change the active working directory (with no argument, use your home directory)
@@ -636,6 +657,7 @@ fn help_text() -> String {
 /sessions - List saved sessions and their IDs
 /diff - Show staged, unstaged, and untracked working-tree changes
 /review [instructions] - Review the current working-tree changes in this session
+/rewind [checkpoint-id] [conversation|code|both|fork] - List or restore automatic turn checkpoints
 /queue [message|clear] - Queue steering guidance for the next agent turn, show it, or clear it
 /ps - List background terminal processes through the governed process tools
 /stop <process-id> - Stop a background process through the governed process tools
@@ -1235,6 +1257,25 @@ mod tests {
 
         // Test /editfoo is not a valid command
         assert!(handle_slash_command("/editfoo").is_none());
+    }
+
+    #[test]
+    fn test_rewind_command() {
+        let Some(InputResult::Rewind(options)) = handle_slash_command("/rewind") else {
+            panic!("Expected Rewind");
+        };
+        assert!(options.selector.is_none());
+        assert!(options.action.is_none());
+
+        let Some(InputResult::Rewind(options)) =
+            handle_slash_command("/rewind 20260811T120000.000Z both")
+        else {
+            panic!("Expected Rewind with options");
+        };
+        assert_eq!(options.selector.as_deref(), Some("20260811T120000.000Z"));
+        assert_eq!(options.action.as_deref(), Some("both"));
+
+        assert!(handle_slash_command("/rewindish").is_none());
     }
 
     #[test]

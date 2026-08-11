@@ -1,4 +1,5 @@
 mod builder;
+mod checkpoints;
 mod completion;
 pub mod editor;
 mod elicitation;
@@ -79,11 +80,12 @@ const NULL_DEVICE: &str = "/dev/null";
 #[cfg(target_os = "windows")]
 const NULL_DEVICE: &str = "NUL";
 
-const THINKING_EFFORTS: [ThinkingEffort; 5] = [
+const THINKING_EFFORTS: [ThinkingEffort; 6] = [
     ThinkingEffort::Off,
     ThinkingEffort::Low,
     ThinkingEffort::Medium,
     ThinkingEffort::High,
+    ThinkingEffort::XHigh,
     ThinkingEffort::Max,
 ];
 
@@ -112,6 +114,51 @@ fn permission_policy_name(mode: GooseMode) -> &'static str {
         GooseMode::Auto => "no-perms",
         GooseMode::Chat => "read-only",
     }
+}
+
+fn governed_agent_requires_confirmation(
+    governed: bool,
+    mode: GooseMode,
+) -> std::result::Result<bool, &'static str> {
+    if !governed || mode == GooseMode::Auto {
+        return Ok(false);
+    }
+    if mode == GooseMode::Chat {
+        return Err("Subagent delegation is unavailable while this governed session is read-only.");
+    }
+    Ok(true)
+}
+
+fn preserve_stream_draft(prefill: &mut Option<String>, draft: String) {
+    if !draft.is_empty() {
+        *prefill = Some(draft);
+    }
+}
+
+fn governed_provider_allowed(governed: bool, provider: Option<&str>) -> bool {
+    !governed || provider.is_none_or(|name| name == "openai")
+}
+
+fn code_rewind_block_reason(
+    governed: bool,
+    capability_mode: Option<&str>,
+    approval_mode: GooseMode,
+) -> Option<&'static str> {
+    if governed && capability_mode == Some("read-only") {
+        return Some(
+            "Code rewind is unavailable under ExactCode's read-only capability policy. Conversation rewind and fork remain available.",
+        );
+    }
+    if approval_mode == GooseMode::Chat {
+        return Some(
+            "Code rewind is unavailable while this session's approval policy is read-only.",
+        );
+    }
+    None
+}
+
+fn governed_no_prompts_allowed(governed: bool, capability_mode: Option<&str>) -> bool {
+    !governed || capability_mode == Some("read_only")
 }
 
 fn slash_tool_matches(registered_name: &str, tool_name: &str) -> bool {
@@ -786,6 +833,12 @@ impl CliSession {
         interactive: bool,
     ) -> Result<()> {
         let cancel_token = cancel_token.clone();
+        if interactive {
+            let prompt = message.as_concat_text();
+            if let Err(error) = self.capture_turn_checkpoint(&prompt).await {
+                warn!(error = %error, "failed to capture automatic turn checkpoint");
+            }
+        }
         self.push_message(message);
         self.process_agent_response(interactive, cancel_token)
             .await?;
@@ -1014,6 +1067,10 @@ impl CliSession {
                 self.handle_review(instructions.as_deref(), history, editor)
                     .await?;
             }
+            InputResult::Rewind(options) => {
+                history.save(editor);
+                self.handle_rewind(options).await?;
+            }
             InputResult::Queue(message) => {
                 history.save(editor);
                 self.handle_queue(message.as_deref()).await;
@@ -1106,6 +1163,11 @@ impl CliSession {
         history: &HistoryManager,
         editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     ) -> Result<()> {
+        if let Err(error) = self.capture_turn_checkpoint(content).await {
+            output::render_error(&format!(
+                "Turn checkpoint could not be saved; continuing without it: {error:#}"
+            ));
+        }
         let message = images::message_with_images(content, &mut self.pending_images);
         match self.run_mode {
             RunMode::Normal => {
@@ -1301,7 +1363,7 @@ impl CliSession {
             ));
             return Ok(());
         } else {
-            let items = vec![
+            let mut items = vec![
                 (
                     "ask".to_string(),
                     "Ask".to_string(),
@@ -1312,17 +1374,22 @@ impl CliSession {
                     "Accept edits".to_string(),
                     "ask only for sensitive calls".to_string(),
                 ),
-                (
+            ];
+            if governed_no_prompts_allowed(
+                governed_workspace_root()?.is_some(),
+                std::env::var("EXACTCODE_CAPABILITY_MODE").ok().as_deref(),
+            ) {
+                items.push((
                     "no-perms".to_string(),
                     "No prompts".to_string(),
                     "let the governed host policy decide".to_string(),
-                ),
-                (
-                    "read-only".to_string(),
-                    "Read only".to_string(),
-                    "disable all tool calls in Goose".to_string(),
-                ),
-            ];
+                ));
+            }
+            items.push((
+                "read-only".to_string(),
+                "Read only".to_string(),
+                "disable all tool calls in Goose".to_string(),
+            ));
             match cliclack::select("Approval policy for this session:")
                 .items(&items)
                 .initial_value(permission_policy_name(current).to_string())
@@ -1340,8 +1407,18 @@ impl CliSession {
             );
             return Ok(());
         };
+        let governed = governed_workspace_root()?.is_some();
+        let capability_mode = std::env::var("EXACTCODE_CAPABILITY_MODE").ok();
+        if policy == "no-perms"
+            && !governed_no_prompts_allowed(governed, capability_mode.as_deref())
+        {
+            output::render_error(
+                "No-prompts mode is unavailable because this ExactCode-governed session has a writable host bridge. Persist `ecode permissions no-perms` and restart `ecode` to relaunch under ExactCode's read-only capability, or use ask/accept-edit in this session.",
+            );
+            return Ok(());
+        }
         self.agent.update_goose_mode(mode, &self.session_id).await?;
-        let boundary = if governed_workspace_root()?.is_some() {
+        let boundary = if governed {
             " ExactCode's workspace capability and allow/deny policy remain the hard ceiling."
         } else {
             ""
@@ -1369,20 +1446,22 @@ impl CliSession {
         let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
             output::session_message(&format!(
                 "Current session reasoning effort: '{current}'\n\
-                 Tip: use '/think off|low|medium|high|max' or press Shift+Tab to cycle."
+                 Tip: use '/think off|low|medium|high|xhigh|max' or press Shift+Tab to cycle."
             ));
             return Ok(());
         };
 
         if requested.split_whitespace().count() != 1 {
-            output::render_error("Expected one reasoning effort: off, low, medium, high, or max.");
+            output::render_error(
+                "Expected one reasoning effort: off, low, medium, high, xhigh, or max.",
+            );
             return Ok(());
         }
         let effort = match ThinkingEffort::from_str(requested) {
             Ok(effort) => effort,
             Err(_) => {
                 output::render_error(&format!(
-                    "Invalid reasoning effort '{requested}'. Use off, low, medium, high, or max."
+                    "Invalid reasoning effort '{requested}'. Use off, low, medium, high, xhigh, or max."
                 ));
                 return Ok(());
             }
@@ -1527,6 +1606,25 @@ impl CliSession {
 
         let manager = &self.agent.config.session_manager;
         let target = manager.get_session(target_id, true).await?;
+        let governed = governed_workspace_root()?.is_some();
+        if !governed_provider_allowed(governed, target.provider_name.as_deref()) {
+            anyhow::bail!(
+                "Cannot resume '{}': ExactCode-governed sessions require the 'openai' shim provider, but this session saved provider '{}'.",
+                target.name,
+                target.provider_name.as_deref().unwrap_or_default(),
+            );
+        }
+        if target.goose_mode == GooseMode::Auto
+            && !governed_no_prompts_allowed(
+                governed,
+                std::env::var("EXACTCODE_CAPABILITY_MODE").ok().as_deref(),
+            )
+        {
+            anyhow::bail!(
+                "Cannot resume '{}': it saved Auto/no-prompts mode, but this ExactCode-governed host bridge is writable. Resume after launching ExactCode read-only, or use a session saved with ask/accept-edit.",
+                target.name,
+            );
+        }
         let target_working_dir = enforce_governed_workspace(&target.working_dir)
             .with_context(|| format!("Cannot resume '{}'", target.name))?;
 
@@ -1741,6 +1839,225 @@ impl CliSession {
         self.handle_message_input(&prompt, history, editor).await
     }
 
+    async fn capture_turn_checkpoint(&self, prompt: &str) -> Result<checkpoints::TurnCheckpoint> {
+        let working_dir = self.current_session_working_directory().await?;
+        let authorized_root = governed_workspace_root()?;
+        checkpoints::CheckpointJournal::new(&self.session_id)?.capture(
+            &working_dir,
+            authorized_root.as_deref(),
+            &self.messages,
+            prompt,
+        )
+    }
+
+    async fn handle_rewind(&mut self, options: input::RewindCommandOptions) -> Result<()> {
+        let journal = checkpoints::CheckpointJournal::new(&self.session_id)?;
+        let Some(selector) = options
+            .selector
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            let checkpoints = journal.list()?;
+            if checkpoints.is_empty() {
+                output::session_message(
+                    "No turn checkpoints yet. One is saved automatically before each submitted prompt.",
+                );
+                return Ok(());
+            }
+            output::session_message("Automatic turn checkpoints (newest first):");
+            for checkpoint in checkpoints.iter().take(20) {
+                let code = if checkpoint.code.is_some() {
+                    "code+conversation"
+                } else {
+                    "conversation only"
+                };
+                let prompt = safe_truncate(checkpoint.prompt.trim(), 72);
+                println!(
+                    "  {} · {} · {} · {}",
+                    checkpoint.id,
+                    checkpoint.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    code,
+                    if prompt.is_empty() {
+                        "(no prompt)"
+                    } else {
+                        &prompt
+                    }
+                );
+                if let Some(reason) = &checkpoint.code_unavailable_reason {
+                    println!("    code unavailable: {}", safe_truncate(reason, 120));
+                }
+            }
+            if checkpoints.len() > 20 {
+                output::session_message(&format!(
+                    "Showing 20 of {} checkpoints",
+                    checkpoints.len()
+                ));
+            }
+            output::session_message(
+                "Restore with /rewind <id> conversation|code|both, or branch from the earlier conversation with /rewind <id> fork.",
+            );
+            return Ok(());
+        };
+
+        let action = options
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("conversation")
+            .to_ascii_lowercase();
+        if !matches!(action.as_str(), "conversation" | "code" | "both" | "fork") {
+            output::render_error("Usage: /rewind <checkpoint-id> [conversation|code|both|fork]");
+            return Ok(());
+        }
+        let checkpoint = match journal.get(selector) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                output::render_error(&error.to_string());
+                return Ok(());
+            }
+        };
+
+        let checkpoint_working_dir = match enforce_governed_workspace(&checkpoint.working_dir) {
+            Ok(path) => path,
+            Err(error) => {
+                output::render_error(&format!(
+                    "Checkpoint working directory is no longer available: {error:#}"
+                ));
+                return Ok(());
+            }
+        };
+
+        if action == "fork" {
+            let manager = &self.agent.config.session_manager;
+            let current = manager.get_session(&self.session_id, false).await?;
+            let parent_id = self.session_id.clone();
+            let name = format!("{} (rewind {})", current.name, checkpoint.id);
+            let fork = manager.copy_session(&parent_id, name.clone()).await?;
+            manager
+                .replace_conversation(&fork.id, &checkpoint.conversation)
+                .await?;
+            manager
+                .update(&fork.id)
+                .user_provided_name(name)
+                .parent_session_id(Some(parent_id))
+                .working_dir(checkpoint_working_dir)
+                .apply()
+                .await?;
+            self.activate_session(&fork.id).await?;
+            if !checkpoint.prompt.trim().is_empty() {
+                self.stream_input_prefill = Some(checkpoint.prompt.clone());
+            }
+            output::session_message(&format!(
+                "Forked from checkpoint {}. Its original prompt is ready to edit; code was not changed.",
+                checkpoint.id
+            ));
+            return Ok(());
+        }
+
+        let restores_code = matches!(action.as_str(), "code" | "both");
+        let restores_conversation = matches!(action.as_str(), "conversation" | "both");
+        if restores_code {
+            let session = self
+                .agent
+                .config
+                .session_manager
+                .get_session(&self.session_id, false)
+                .await?;
+            let governed = std::env::var(GOVERNED_SESSION_ENV).as_deref() == Ok("1");
+            let capability = std::env::var("EXACTCODE_CAPABILITY_MODE").ok();
+            if let Some(reason) =
+                code_rewind_block_reason(governed, capability.as_deref(), session.goose_mode)
+            {
+                output::render_error(reason);
+                return Ok(());
+            }
+            if checkpoint.code.is_none() {
+                output::render_error(
+                    checkpoint
+                        .code_unavailable_reason
+                        .as_deref()
+                        .unwrap_or("This checkpoint has no code snapshot"),
+                );
+                return Ok(());
+            }
+        }
+
+        if !std::io::stdin().is_terminal() {
+            output::render_error(
+                "Rewind requires an interactive confirmation because it discards newer state.",
+            );
+            return Ok(());
+        }
+        let confirmed = match cliclack::confirm(format!(
+            "Restore {action} state from checkpoint {}? A safety checkpoint will be saved first.",
+            checkpoint.id
+        ))
+        .initial_value(false)
+        .interact()
+        {
+            Ok(confirmed) => confirmed,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !confirmed {
+            output::session_message("Nothing was rewound");
+            return Ok(());
+        }
+
+        // This captures both layers before the first destructive operation, so
+        // a failed or regretted rewind is itself recoverable.
+        let safety = self.capture_turn_checkpoint("").await?;
+        let authorized_root = governed_workspace_root()?;
+        if let Some(code) = checkpoint.code.as_ref().filter(|_| restores_code) {
+            if let Err(error) =
+                checkpoints::restore_git(code, &checkpoint_working_dir, authorized_root.as_deref())
+            {
+                output::render_error(&format!(
+                    "Code rewind failed before conversation history changed: {error:#}. Safety checkpoint: {}",
+                    safety.id
+                ));
+                return Ok(());
+            }
+        }
+        if restores_conversation {
+            let current_working_dir = self.current_session_working_directory().await?;
+            if current_working_dir != checkpoint_working_dir {
+                let Some(path) = checkpoint_working_dir.to_str() else {
+                    output::render_error(
+                        "Checkpoint working directory cannot be represented in this terminal.",
+                    );
+                    return Ok(());
+                };
+                self.handle_change_directory(Some(path)).await?;
+            }
+            self.agent
+                .config
+                .session_manager
+                .replace_conversation(&self.session_id, &checkpoint.conversation)
+                .await?;
+            self.messages = checkpoint.conversation.clone();
+            self.pending_images.clear();
+            self.queued_followups.clear();
+            self.agent.discard_pending_steers(&self.session_id).await;
+            if !checkpoint.prompt.trim().is_empty() {
+                self.stream_input_prefill = Some(checkpoint.prompt.clone());
+            }
+        }
+        output::session_message(&format!(
+            "Restored {action} state from {}. Safety checkpoint: {}{}",
+            checkpoint.id,
+            safety.id,
+            if restores_conversation && !checkpoint.prompt.trim().is_empty() {
+                ". The original prompt is ready to edit"
+            } else {
+                ""
+            }
+        ));
+        Ok(())
+    }
+
     async fn handle_queue(&self, requested: Option<&str>) {
         let requested = requested.map(str::trim).filter(|value| !value.is_empty());
         match requested {
@@ -1880,13 +2197,58 @@ impl CliSession {
             }
             return self
                 .call_slash_tool(
-                    "summon__load",
-                    serde_json::json!({"source": task_id, "cancel": true})
+                    "summon__cancel",
+                    serde_json::json!({"source": task_id})
                         .as_object()
                         .expect("literal object")
                         .clone(),
                 )
                 .await;
+        }
+
+        let session = self
+            .agent
+            .config
+            .session_manager
+            .get_session(&self.session_id, false)
+            .await?;
+        let governed = governed_workspace_root()?.is_some();
+        let requires_confirmation =
+            match governed_agent_requires_confirmation(governed, session.goose_mode) {
+                Ok(requires_confirmation) => requires_confirmation,
+                Err(error) => {
+                    output::render_error(error);
+                    return Ok(());
+                }
+            };
+        if requires_confirmation {
+            output::session_message(&format!(
+                "Current session policy: '{}'. A delegated child runs without further approval prompts after this one-time task approval. ExactCode's capability and allow/deny boundary remain the hard ceiling.",
+                permission_policy_name(session.goose_mode),
+            ));
+            let summary = safe_truncate(instructions, 160);
+            let confirmed = match cliclack::confirm(format!(
+                "Delegate this task with unattended authority: '{summary}'?"
+            ))
+            .initial_value(false)
+            .interact()
+            {
+                Ok(confirmed) => confirmed,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+                Err(error) => return Err(error.into()),
+            };
+            if !confirmed {
+                output::session_message("Subagent was not started");
+                return Ok(());
+            }
+        }
+        if let Err(error) = self
+            .capture_turn_checkpoint(&format!("/agent {instructions}"))
+            .await
+        {
+            output::render_error(&format!(
+                "Delegation checkpoint could not be saved; continuing without it: {error:#}"
+            ));
         }
         self.call_slash_tool(
             "summon__delegate",
@@ -1965,6 +2327,16 @@ impl CliSession {
 
         if options.provider.is_some() && requested_provider.is_none() {
             output::render_error("Provider name is required after '--provider'.");
+            return Ok(());
+        }
+
+        if !governed_provider_allowed(
+            governed_workspace_root()?.is_some(),
+            Some(target_provider_name),
+        ) {
+            output::render_error(
+                "ExactCode-governed sessions use only the 'openai' provider pointed at the signed local gateway shim. Switch model IDs freely, but direct provider switching is disabled.",
+            );
             return Ok(());
         }
 
@@ -2457,6 +2829,11 @@ impl CliSession {
         use futures::StreamExt;
         loop {
             tokio::select! {
+                // If response completion and a terminal key arrive together,
+                // completion wins. This prevents an Enter intended for the
+                // just-finished turn from remaining in Agent's steer queue and
+                // silently changing the next turn.
+                biased;
                 result = stream.next() => {
                     if let Some(input) = live_input.as_mut() {
                         input.clear_line()?;
@@ -2513,6 +2890,10 @@ impl CliSession {
                                     self.messages.push(response_message);
                                     cancel_token_clone.cancel();
                                     drop(stream);
+                                    preserve_stream_draft(
+                                        &mut self.stream_input_prefill,
+                                        buffered_input,
+                                    );
                                     break;
                                 }
                                 self.agent.handle_confirmation(id, PermissionConfirmation {
@@ -2574,6 +2955,10 @@ impl CliSession {
                                         if should_cancel {
                                             cancel_token_clone.cancel();
                                             drop(stream);
+                                            preserve_stream_draft(
+                                                &mut self.stream_input_prefill,
+                                                buffered_input,
+                                            );
                                             break;
                                         }
                                     }
@@ -2581,6 +2966,10 @@ impl CliSession {
                                         output::render_error(&format!("Failed to collect input: {}", e));
                                         cancel_token_clone.cancel();
                                         drop(stream);
+                                        preserve_stream_draft(
+                                            &mut self.stream_input_prefill,
+                                            buffered_input,
+                                        );
                                         break;
                                     }
                                 }
@@ -2668,7 +3057,12 @@ impl CliSession {
                             cancel_token_clone.cancel();
                         }
                         None => {
-                            live_input = None;
+                            if let Some(input) = live_input.take() {
+                                preserve_stream_draft(
+                                    &mut self.stream_input_prefill,
+                                    input.stop()?,
+                                );
+                            }
                         }
                     }
                 }
@@ -2683,10 +3077,7 @@ impl CliSession {
         }
 
         if let Some(input) = live_input.take() {
-            let prefill = input.stop()?;
-            if !prefill.is_empty() {
-                self.stream_input_prefill = Some(prefill);
-            }
+            preserve_stream_draft(&mut self.stream_input_prefill, input.stop()?);
         }
 
         if !is_json_mode && !is_stream_json_mode {
@@ -3811,6 +4202,85 @@ mod tests {
     }
 
     #[test]
+    fn governed_direct_agent_requires_task_consent_except_in_no_prompts_mode() {
+        assert_eq!(
+            governed_agent_requires_confirmation(true, GooseMode::Approve),
+            Ok(true)
+        );
+        assert_eq!(
+            governed_agent_requires_confirmation(true, GooseMode::SmartApprove),
+            Ok(true)
+        );
+        assert_eq!(
+            governed_agent_requires_confirmation(true, GooseMode::Auto),
+            Ok(false)
+        );
+        assert!(governed_agent_requires_confirmation(true, GooseMode::Chat)
+            .unwrap_err()
+            .contains("read-only"));
+    }
+
+    #[test]
+    fn standalone_direct_agent_keeps_existing_prompt_behavior() {
+        for mode in [
+            GooseMode::Approve,
+            GooseMode::SmartApprove,
+            GooseMode::Auto,
+            GooseMode::Chat,
+        ] {
+            assert_eq!(governed_agent_requires_confirmation(false, mode), Ok(false));
+        }
+    }
+
+    #[test]
+    fn streaming_draft_preservation_keeps_nonempty_input_only() {
+        let mut prefill = Some("existing".to_string());
+        preserve_stream_draft(&mut prefill, String::new());
+        assert_eq!(prefill.as_deref(), Some("existing"));
+
+        preserve_stream_draft(&mut prefill, "unfinished guidance".to_string());
+        assert_eq!(prefill.as_deref(), Some("unfinished guidance"));
+    }
+
+    #[test]
+    fn governed_sessions_only_accept_the_gateway_shim_provider() {
+        assert!(governed_provider_allowed(true, Some("openai")));
+        assert!(governed_provider_allowed(true, None));
+        assert!(!governed_provider_allowed(true, Some("anthropic")));
+        assert!(!governed_provider_allowed(true, Some("openrouter")));
+        assert!(governed_provider_allowed(false, Some("anthropic")));
+    }
+
+    #[test]
+    fn code_rewind_respects_capability_and_approval_read_only_boundaries() {
+        assert!(
+            code_rewind_block_reason(true, Some("read-only"), GooseMode::Auto)
+                .unwrap()
+                .contains("capability")
+        );
+        assert!(code_rewind_block_reason(false, None, GooseMode::Chat)
+            .unwrap()
+            .contains("approval"));
+        assert_eq!(
+            code_rewind_block_reason(true, Some("workspace-write"), GooseMode::Approve),
+            None
+        );
+        assert_eq!(
+            code_rewind_block_reason(true, Some("full-control"), GooseMode::Auto),
+            None
+        );
+    }
+
+    #[test]
+    fn governed_no_prompts_requires_an_independently_read_only_bridge() {
+        assert!(!governed_no_prompts_allowed(true, Some("workspace_write")));
+        assert!(!governed_no_prompts_allowed(true, Some("full_control")));
+        assert!(!governed_no_prompts_allowed(true, None));
+        assert!(governed_no_prompts_allowed(true, Some("read_only")));
+        assert!(governed_no_prompts_allowed(false, Some("workspace_write")));
+    }
+
+    #[test]
     fn deterministic_slash_tools_match_prefixed_registration_names() {
         assert!(slash_tool_matches(
             "exactcode_host__process.list",
@@ -3848,6 +4318,10 @@ mod tests {
         );
         assert_eq!(
             next_thinking_effort(ThinkingEffort::High),
+            ThinkingEffort::XHigh
+        );
+        assert_eq!(
+            next_thinking_effort(ThinkingEffort::XHigh),
             ThinkingEffort::Max
         );
         assert_eq!(

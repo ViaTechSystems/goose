@@ -811,7 +811,7 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 
 **ViaTech coding-session commands:**
 - **`/model [selection]`** - Show or change the current model
-- **`/think [off|low|medium|high|max]`** - Show or change reasoning effort
+- **`/think [off|low|medium|high|xhigh|max]`** - Show or change reasoning effort; unsupported levels are clamped to the selected provider/model's strongest supported value
 - **`/permissions [ask|accept-edit|no-perms|read-only]`** - Change session approval behavior within the host capability ceiling
 - **`/pwd`**, **`/cd <path>`** - Inspect or change the working directory; governed sessions remain inside their authorized workspace
 - **`/new [name]`**, **`/resume [name-or-id]`**, **`/fork [name]`**, **`/rename <name>`**, **`/sessions`** - Manage durable sessions
@@ -821,6 +821,7 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 - **`/image <path...>`**, **`/images [clear]`** - Queue, inspect, or clear PNG, JPEG, or WebP images for the next turn. Each turn accepts up to four images, 10 MiB each and 20 MiB combined; governed sessions also confine paths (including symlink targets) to the authorized workspace
 - **`/ps`**, **`/stop <process-id>`** - Inspect or stop governed background processes
 - **`/subagents`** (alias **`/agents`**), **`/agent <task>`**, **`/agent stop <id>`** - Inspect, start, or stop Summon subagents
+- **`/rewind [checkpoint-id] [conversation|code|both|fork]`** - List private pre-turn checkpoints; after confirmation, restore conversation, Git-backed code, or both, or create a non-destructive child session from the earlier conversation
 - **`/status`** - Inspect the current model, provider, mode, and token usage
 - **`/edit [text]`** - Open the configured prompt editor to compose a message, optionally pre-filled with text
 
@@ -848,7 +849,25 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 # Attach an image to the next message, then inspect the pending attachment
 /image ./screenshots/failure.png
 /images
+
+# List checkpoints, then create a conversation fork without changing code
+/rewind
+/rewind <checkpoint-id> fork
 ```
+
+Automatic checkpoints are private to the local goose state and are bounded to
+100 entries or 256 MiB. Conversation checkpoints work outside Git. Code restore
+keeps staged, unstaged, and non-ignored untracked state distinct, but deliberately
+does not capture ignored files, sparse checkouts, or submodule worktrees. A
+confirmed code restore uses normal Git checkout semantics, so configured Git
+smudge/process filters may run during the restore.
+
+In an ExactCode-governed session, repository-provided goose plugins, command
+hooks, and plugin MCP servers are blocked by default. An operator may opt in for
+that launch with `EXACTCODE_TRUST_PROJECT_PLUGINS=1`. Treat this as trusting code
+from the repository: command hooks run with the user's operating-system
+permissions. Installed user plugins remain available under the normal goose
+configuration.
 You can also create [custom slash commands for running recipes](/docs/guides/context-engineering/slash-commands) in goose Desktop or the CLI. 
 
 ---

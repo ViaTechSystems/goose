@@ -37,7 +37,7 @@ pub const CODEX_KNOWN_MODELS: &[&str] = &[
 pub const CODEX_DOC_URL: &str = "https://developers.openai.com/codex/cli";
 
 /// Valid reasoning effort levels for Codex
-pub const CODEX_REASONING_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+pub const CODEX_REASONING_LEVELS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 
 /// Spawns the Codex CLI (`codex exec`) as a one-shot child process per turn.
 /// Text prompt is piped via stdin (`-`), images are passed as temporary files
@@ -66,12 +66,13 @@ impl CodexProvider {
                 "low" => Some(ThinkingEffort::Low),
                 "medium" => Some(ThinkingEffort::Medium),
                 "high" => Some(ThinkingEffort::High),
-                "xhigh" => Some(ThinkingEffort::Max),
+                "xhigh" => Some(ThinkingEffort::XHigh),
+                "max" => Some(ThinkingEffort::Max),
                 _ => None,
             })
     }
 
-    fn map_thinking_effort(_model_name: &str, effort: Option<ThinkingEffort>) -> Option<String> {
+    fn map_thinking_effort(model_name: &str, effort: Option<ThinkingEffort>) -> Option<String> {
         use ThinkingEffort;
         match effort
             .or_else(Self::legacy_reasoning_effort)
@@ -81,6 +82,8 @@ impl CodexProvider {
             ThinkingEffort::Low => Some("low".to_string()),
             ThinkingEffort::Medium => Some("medium".to_string()),
             ThinkingEffort::High => Some("high".to_string()),
+            ThinkingEffort::XHigh => Some("xhigh".to_string()),
+            ThinkingEffort::Max if model_name.contains("gpt-5.6") => Some("max".to_string()),
             ThinkingEffort::Max => Some("xhigh".to_string()),
         }
     }
@@ -1002,6 +1005,7 @@ mod tests {
         assert!(CODEX_REASONING_LEVELS.contains(&"medium"));
         assert!(CODEX_REASONING_LEVELS.contains(&"high"));
         assert!(CODEX_REASONING_LEVELS.contains(&"xhigh"));
+        assert!(CODEX_REASONING_LEVELS.contains(&"max"));
         assert!(!CODEX_REASONING_LEVELS.contains(&"minimal"));
         assert!(!CODEX_REASONING_LEVELS.contains(&"invalid"));
     }
@@ -1243,6 +1247,14 @@ mod tests {
         assert_eq!(
             CodexProvider::map_thinking_effort("gpt-5.2-codex", Some(ThinkingEffort::Max)),
             Some("xhigh".to_string())
+        );
+        assert_eq!(
+            CodexProvider::map_thinking_effort("gpt-5.6-sol", Some(ThinkingEffort::XHigh)),
+            Some("xhigh".to_string())
+        );
+        assert_eq!(
+            CodexProvider::map_thinking_effort("gpt-5.6-sol", Some(ThinkingEffort::Max)),
+            Some("max".to_string())
         );
         assert_eq!(
             CodexProvider::map_thinking_effort("gpt-5.2-codex", None),

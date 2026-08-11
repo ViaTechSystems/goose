@@ -32,7 +32,10 @@ curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/down
 The installer supports macOS, Linux, WSL, Android/Termux, Git Bash, and MSYS2.
 It downloads only from `ViaTechSystems/goose`, requires a one-line SHA-256
 sidecar naming the exact archive, verifies the archive before extraction, and
-preserves the previous Unix binary if replacement fails. Set `CONFIGURE=false`
+uses a private temporary directory, validates archive members, and serializes
+same-destination installs. Unix replacement is an atomic same-filesystem rename;
+native Windows stages the executable and runtime DLLs as one rollback-backed
+transaction. A failed promotion preserves the previous installation. Set `CONFIGURE=false`
 for a non-interactive install, `GOOSE_BIN_DIR` for a custom destination, or
 `GOOSE_VERSION=vX.Y.Z` to pin a published release. Native PowerShell does not
 yet have a checksum-backed ViaTech installer; use the Cargo command in the

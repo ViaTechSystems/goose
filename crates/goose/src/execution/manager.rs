@@ -1,5 +1,7 @@
 use crate::agents::mcp_client::GooseMcpHostInfo;
-use crate::agents::{Agent, AgentConfig, ExtensionLoadResult, GoosePlatform};
+use crate::agents::{
+    configured_additional_system_prompt, Agent, AgentConfig, ExtensionLoadResult, GoosePlatform,
+};
 use crate::config::permission::PermissionManager;
 use crate::config::Config;
 use crate::scheduler_trait::SchedulerTrait;
@@ -201,6 +203,11 @@ impl AgentManager {
         config.use_login_shell_path = runtime_context.use_login_shell_path;
         config.session_name_update_tx = runtime_context.session_name_update_tx;
         let agent = Arc::new(Agent::with_config(config));
+        if let Some(prompt) = configured_additional_system_prompt(Config::global())? {
+            agent
+                .extend_system_prompt("configured-additional".to_string(), prompt)
+                .await;
+        }
         let mut extension_results = Vec::new();
 
         if let Ok(session) = self

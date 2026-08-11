@@ -1708,9 +1708,10 @@ pub fn xai_reasoning_effort_for_thinking(
         ThinkingEffort::Off => Some("low".to_string()),
         ThinkingEffort::Low => Some("low".to_string()),
         ThinkingEffort::Medium if supports_medium => Some("medium".to_string()),
-        ThinkingEffort::Medium | ThinkingEffort::High | ThinkingEffort::Max => {
-            Some("high".to_string())
-        }
+        ThinkingEffort::Medium
+        | ThinkingEffort::High
+        | ThinkingEffort::XHigh
+        | ThinkingEffort::Max => Some("high".to_string()),
     }
 }
 
@@ -1725,7 +1726,8 @@ pub fn openai_reasoning_effort_for_thinking(
         ThinkingEffort::Low => &["low", "medium", "high", "xhigh"],
         ThinkingEffort::Medium => &["medium", "high", "low", "xhigh"],
         ThinkingEffort::High => &["high", "medium", "xhigh", "low"],
-        ThinkingEffort::Max => &["xhigh", "high", "medium", "low"],
+        ThinkingEffort::XHigh => &["xhigh", "high", "medium", "low"],
+        ThinkingEffort::Max => &["max", "xhigh", "high", "medium", "low"],
     };
 
     preferred
@@ -1747,7 +1749,11 @@ pub(crate) fn openai_reasoning_efforts_for_model(model_name: &str) -> &'static [
             || normalized.contains("gpt-5.6")
             || normalized.contains("gpt-5-6")
         {
-            &["none", "low", "medium", "high", "xhigh"]
+            if normalized.contains("gpt-5.6") || normalized.contains("gpt-5-6") {
+                &["none", "low", "medium", "high", "xhigh", "max"]
+            } else {
+                &["none", "low", "medium", "high", "xhigh"]
+            }
         } else {
             &["low", "medium", "high"]
         }
@@ -2816,7 +2822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_request_gpt56_max_effort_uses_xhigh() -> anyhow::Result<()> {
+    fn test_create_request_gpt56_max_effort_uses_max() -> anyhow::Result<()> {
         let model_config = test_model_config("gpt-5.6-luna")
             .with_max_tokens(Some(1024))
             .with_thinking_effort(ThinkingEffort::Max);
@@ -2830,9 +2836,28 @@ mod tests {
         )?;
         let obj = request.as_object().unwrap();
 
-        assert_eq!(obj.get("reasoning_effort"), Some(&json!("xhigh")));
+        assert_eq!(obj.get("reasoning_effort"), Some(&json!("max")));
         assert!(obj.get("thinking_effort").is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_request_gpt56_xhigh_remains_distinct() -> anyhow::Result<()> {
+        let model_config = test_model_config("gpt-5.6-sol")
+            .with_max_tokens(Some(1024))
+            .with_thinking_effort(ThinkingEffort::XHigh);
+        let request = create_request(
+            &model_config,
+            "system",
+            &[],
+            &[],
+            &ImageFormat::OpenAi,
+            false,
+        )?;
+        let obj = request.as_object().unwrap();
+
+        assert_eq!(obj.get("reasoning_effort"), Some(&json!("xhigh")));
         Ok(())
     }
 

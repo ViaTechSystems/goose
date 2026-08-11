@@ -650,7 +650,9 @@ fn get_thinking_config(
             ThinkingEffort::Off | ThinkingEffort::Low => ThinkingLevel::Low,
             ThinkingEffort::Medium if model_name.starts_with("gemini-3-pro") => ThinkingLevel::Low,
             ThinkingEffort::Medium => ThinkingLevel::Medium,
-            ThinkingEffort::High | ThinkingEffort::Max => ThinkingLevel::High,
+            ThinkingEffort::High | ThinkingEffort::XHigh | ThinkingEffort::Max => {
+                ThinkingLevel::High
+            }
         };
 
         Some(ThinkingConfig {
