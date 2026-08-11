@@ -23,6 +23,9 @@ jobs:
       - name: Test private staging and atomic promotion
         run: bash scripts/test_download_cli_security.sh
 
+      - name: Check release version consistency
+        run: bash scripts/check-release-version-consistency.sh
+
   changes:
     runs-on: ubuntu-latest
     outputs:
