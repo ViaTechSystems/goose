@@ -821,7 +821,14 @@ impl Operation for ToolExecutionOperation<'_> {
                                 .iter()
                                 .find(|r| r.id == request_id)
                                 .and_then(|r| r.metadata.as_ref());
-                            response.add_tool_response_with_metadata(request_id, output, metadata);
+                            response.add_tool_response_with_metadata(request_id.clone(), output, metadata);
+                            if let Some(request) = requests.iter().find(|request| request.id == request_id) {
+                                crate::agents::goal::bind_verification_snapshot(
+                                    &session.working_dir,
+                                    request,
+                                    &mut response,
+                                );
+                            }
                         }
                         ToolStreamItem::Message(msg) => {
                             emit.emit(AgentEvent::McpNotification((request_id, msg)))

@@ -57,7 +57,19 @@ fn discover_enabled_plugins_with_config(
     project_root: Option<&Path>,
     config: &Config,
 ) -> Vec<DiscoveredPlugin> {
-    let scoped_settings = load_all_settings(project_root);
+    discover_enabled_plugins_with_config_and_user_settings(
+        project_root,
+        config,
+        user_settings_path().as_deref(),
+    )
+}
+
+fn discover_enabled_plugins_with_config_and_user_settings(
+    project_root: Option<&Path>,
+    config: &Config,
+    user_settings: Option<&Path>,
+) -> Vec<DiscoveredPlugin> {
+    let scoped_settings = load_all_settings(project_root, user_settings);
     let mut found: HashMap<String, DiscoveredPlugin> = HashMap::new();
 
     if let Some(root) = project_root {
@@ -168,10 +180,13 @@ fn list_dir_children(dir: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-fn load_all_settings(project_root: Option<&Path>) -> Vec<(SettingsScope, PluginSettings)> {
+fn load_all_settings(
+    project_root: Option<&Path>,
+    user_settings: Option<&Path>,
+) -> Vec<(SettingsScope, PluginSettings)> {
     let mut paths: Vec<(SettingsScope, PathBuf)> = Vec::new();
-    if let Some(path) = user_settings_path() {
-        paths.push((SettingsScope::User, path));
+    if let Some(path) = user_settings {
+        paths.push((SettingsScope::User, path.to_path_buf()));
     }
     if let Some(root) = project_root {
         paths.push((SettingsScope::Project, project_settings_path(root, false)));
@@ -256,7 +271,11 @@ mod tests {
 
     fn discover(project: &Path) -> Vec<DiscoveredPlugin> {
         let cfg_dir = tempfile::tempdir().unwrap();
-        discover_enabled_plugins_with_config(Some(project), &test_config(cfg_dir.path()))
+        discover_enabled_plugins_with_config_and_user_settings(
+            Some(project),
+            &test_config(cfg_dir.path()),
+            None,
+        )
     }
 
     #[test]
@@ -345,13 +364,18 @@ mod tests {
             r#"{"enabledPlugins":["demo"]}"#,
         );
 
-        let prev = std::env::var("GOOSE_PATH_ROOT").ok();
-        unsafe { std::env::set_var("GOOSE_PATH_ROOT", fake_home.path()) };
-        let found = discover(project);
-        match prev {
-            Some(v) => unsafe { std::env::set_var("GOOSE_PATH_ROOT", v) },
-            None => unsafe { std::env::remove_var("GOOSE_PATH_ROOT") },
-        }
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let found = discover_enabled_plugins_with_config_and_user_settings(
+            Some(project),
+            &test_config(cfg_dir.path()),
+            Some(
+                &fake_home
+                    .path()
+                    .join(".config")
+                    .join("goose")
+                    .join("settings.json"),
+            ),
+        );
 
         assert!(
             found.iter().any(|p| p.name == "demo"),
@@ -369,7 +393,8 @@ mod tests {
         let cfg_dir = tempfile::tempdir().unwrap();
         let config = test_config(cfg_dir.path());
 
-        let found = discover_enabled_plugins_with_config(Some(project), &config);
+        let found =
+            discover_enabled_plugins_with_config_and_user_settings(Some(project), &config, None);
         assert!(found.iter().any(|p| p.name == "demo"));
 
         let entries: HashMap<String, PluginConfigEntry> =
@@ -403,7 +428,8 @@ mod tests {
         let entries = HashMap::from([(key, PluginConfigEntry { enabled: false })]);
         config.set_param(PLUGINS_CONFIG_KEY, entries).unwrap();
 
-        let found = discover_enabled_plugins_with_config(Some(project), &config);
+        let found =
+            discover_enabled_plugins_with_config_and_user_settings(Some(project), &config, None);
         assert!(found.iter().all(|p| p.name != "demo"));
     }
 
@@ -428,7 +454,8 @@ mod tests {
             )
             .unwrap();
 
-        let found = discover_enabled_plugins_with_config(Some(project), &config);
+        let found =
+            discover_enabled_plugins_with_config_and_user_settings(Some(project), &config, None);
         assert!(found.iter().any(|p| p.name == "demo"));
 
         let entries: HashMap<String, PluginConfigEntry> =

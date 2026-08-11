@@ -11,7 +11,7 @@ set -eu
 # Supported Architectures: x86_64, arm64
 #
 # Usage:
-#   curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+#   curl -fsSL https://github.com/ViaTechSystems/goose/releases/download/stable/download_cli.sh | bash
 #
 # Environment variables:
 #   GOOSE_BIN_DIR  - Directory to which goose will be installed (default: $HOME/.local/bin)
@@ -54,7 +54,7 @@ fi
 
 
 # --- 2) Variables ---
-REPO="aaif-goose/goose"
+REPO="ViaTechSystems/goose"
 OUT_FILE="goose"
 
 # Set default bin directory based on detected OS environment
@@ -230,7 +230,7 @@ echo "Downloading $RELEASE_TAG release: $FILE..."
 if ! curl -sLf "$DOWNLOAD_URL" --output "$FILE"; then
   # If the download fails, only fall back to latest stable when no version was specified and canary was not requested).
   if ! [ -n "${GOOSE_VERSION:-}" ] && [ "${CANARY:-false}" != "true" ]; then
-    LATEST_TAG=$(curl -s https://api.github.com/repos/aaif-goose/goose/releases/latest | \
+    LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | \
       grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$LATEST_TAG" ]; then
       echo "Error: Failed to download $DOWNLOAD_URL and latest tag unavailable"
@@ -250,6 +250,46 @@ if ! curl -sLf "$DOWNLOAD_URL" --output "$FILE"; then
     exit 1
   fi
 fi
+
+CHECKSUM_FILE="$FILE.sha256"
+CHECKSUM_URL="$DOWNLOAD_URL.sha256"
+echo "Downloading SHA-256 checksum: $CHECKSUM_FILE..."
+if ! curl -sLf "$CHECKSUM_URL" --output "$CHECKSUM_FILE"; then
+  echo "Error: Failed to download required checksum from $CHECKSUM_URL"
+  rm -f "$FILE" "$CHECKSUM_FILE"
+  exit 1
+fi
+
+read -r EXPECTED_SHA256 CHECKSUM_NAME CHECKSUM_EXTRA < "$CHECKSUM_FILE" || true
+CHECKSUM_LINE_COUNT=$(wc -l < "$CHECKSUM_FILE" | tr -d '[:space:]')
+if [ "$CHECKSUM_LINE_COUNT" != "1" ] || \
+   [[ ! "${EXPECTED_SHA256:-}" =~ ^[0-9a-fA-F]{64}$ ]] || \
+   [ "${CHECKSUM_NAME:-}" != "$FILE" ] || [ -n "${CHECKSUM_EXTRA:-}" ]; then
+  echo "Error: Invalid checksum sidecar for $FILE"
+  rm -f "$FILE" "$CHECKSUM_FILE"
+  exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA256=$(sha256sum "$FILE" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA256=$(shasum -a 256 "$FILE" | awk '{print $1}')
+elif command -v openssl >/dev/null 2>&1; then
+  ACTUAL_SHA256=$(openssl dgst -sha256 "$FILE" | awk '{print $NF}')
+else
+  echo "Error: SHA-256 verification requires sha256sum, shasum, or openssl"
+  rm -f "$FILE" "$CHECKSUM_FILE"
+  exit 1
+fi
+
+if [ "$(printf '%s' "$ACTUAL_SHA256" | tr '[:upper:]' '[:lower:]')" != \
+     "$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')" ]; then
+  echo "Error: SHA-256 checksum mismatch for $FILE; refusing to extract it"
+  rm -f "$FILE" "$CHECKSUM_FILE"
+  exit 1
+fi
+echo "Verified SHA-256 checksum for $FILE."
+rm -f "$CHECKSUM_FILE"
 
 # Create a temporary directory for extraction
 TMP_DIR="${TMPDIR:-/tmp}/goose_install_$RANDOM"

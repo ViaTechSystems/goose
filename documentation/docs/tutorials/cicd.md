@@ -17,6 +17,10 @@ goose isn’t just useful on your local machine, it can also streamline tasks in
 
 This guide walks you through setting up goose in your CI/CD pipeline, with a focus on using GitHub Actions for code reviews.
 
+The ViaTech fork does not yet have a public binary release. The examples install
+an explicit source tag with Cargo; replace `REPLACE_WITH_VERSION` only with a
+tag that exists in `ViaTechSystems/goose`.
+
 
 ## Using goose with GitHub Actions
 You can run goose directly within GitHub Actions. Follow these steps to set up your workflow.
@@ -67,10 +71,10 @@ jobs:
 
          - name: Install goose CLI
            run: |
-              mkdir -p /home/runner/.local/bin
-              curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh \
-                | GOOSE_VERSION=REPLACE_WITH_VERSION CONFIGURE=false GOOSE_BIN_DIR=/home/runner/.local/bin bash
-              echo "/home/runner/.local/bin" >> $GITHUB_PATH
+              cargo install --force --git https://github.com/ViaTechSystems/goose \
+                --tag REPLACE_WITH_VERSION goose-cli --locked --no-default-features \
+                --features rustls-tls,code-mode
+              echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
          - name: Configure goose
            run: |
@@ -157,10 +161,10 @@ To install and set up goose in your workflow, add the following steps:
 steps:
     - name: Install goose CLI
       run: |
-          mkdir -p /home/runner/.local/bin
-          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh \
-            | GOOSE_VERSION=REPLACE_WITH_VERSION CONFIGURE=false GOOSE_BIN_DIR=/home/runner/.local/bin bash
-          echo "/home/runner/.local/bin" >> $GITHUB_PATH
+          cargo install --force --git https://github.com/ViaTechSystems/goose \
+            --tag REPLACE_WITH_VERSION goose-cli --locked --no-default-features \
+            --features rustls-tls,code-mode
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Configure goose
       run: |

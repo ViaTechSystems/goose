@@ -8,6 +8,7 @@ use goose::config::{Config, GooseMode};
 use rustyline::Editor;
 use shlex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use strum::VariantNames;
 
@@ -23,7 +24,26 @@ pub enum InputResult {
     ListPrompts(Option<String>),
     PromptCommand(PromptCommandOptions),
     GooseMode(String),
+    Permissions(Option<String>),
     Model(ModelCommandOptions),
+    Thinking(Option<String>),
+    AttachImages(Vec<String>),
+    Images(Option<String>),
+    CycleThinking(String),
+    ChangeDirectory(Option<String>),
+    PrintWorkingDirectory,
+    NewSession(Option<String>),
+    ResumeSession(Option<String>),
+    ForkSession(Option<String>),
+    RenameSession(String),
+    ListSessions,
+    Diff,
+    Review(Option<String>),
+    Queue(Option<String>),
+    ProcessList,
+    StopProcess(String),
+    Subagents,
+    Agent(Option<String>),
     Plan(PlanCommandOptions),
     EndPlan,
     Clear,
@@ -33,6 +53,25 @@ pub enum InputResult {
     Edit(Option<String>),
     ListSkills,
     LoadSkills(Vec<String>),
+}
+
+struct CycleThinkingHandler {
+    requested: Arc<AtomicBool>,
+}
+
+impl rustyline::ConditionalEventHandler for CycleThinkingHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        _ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        self.requested.store(true, Ordering::Release);
+        // Submit the buffer to the local session loop. get_input recognizes the
+        // flag before command parsing, cycles effort, and restores the buffer.
+        Some(rustyline::Cmd::AcceptLine)
+    }
 }
 
 #[derive(Debug)]
@@ -123,6 +162,7 @@ fn should_use_editor_always(
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
+    initial_input: Option<&str>,
 ) -> Result<InputResult> {
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
@@ -152,6 +192,7 @@ pub fn get_input(
         .ok_or_else(|| anyhow::anyhow!("Editor helper not set"))?;
 
     let paste_state = Arc::new(std::sync::RwLock::new(PasteState::default()));
+    let cycle_thinking = Arc::new(AtomicBool::new(false));
 
     editor.bind_sequence(
         rustyline::Event::Any,
@@ -187,7 +228,14 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
-    let input = match read_paste_aware_input(editor, paste_state) {
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::BackTab, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(CycleThinkingHandler {
+            requested: cycle_thinking.clone(),
+        })),
+    );
+
+    let input = match read_paste_aware_input(editor, paste_state, initial_input) {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
@@ -196,11 +244,19 @@ pub fn get_input(
         },
     };
 
+    if cycle_thinking.load(Ordering::Acquire) {
+        return Ok(InputResult::CycleThinking(input));
+    }
+
     // Add valid input to history (history saving to file is handled in the Session::interactive method)
     if !input.trim().is_empty() {
         editor.add_history_entry(input.as_str())?;
     }
 
+    Ok(parse_submitted_input(&input))
+}
+
+pub(super) fn parse_submitted_input(input: &str) -> InputResult {
     // Handle non-slash commands first
     if !input.starts_with('/') {
         let trimmed = input.trim();
@@ -208,19 +264,19 @@ pub fn get_input(
             || trimmed.eq_ignore_ascii_case("exit")
             || trimmed.eq_ignore_ascii_case("quit")
         {
-            return Ok(if trimmed.is_empty() {
+            return if trimmed.is_empty() {
                 InputResult::Retry
             } else {
                 InputResult::Exit
-            });
+            };
         }
-        return Ok(InputResult::Message(trimmed.to_string()));
+        return InputResult::Message(trimmed.to_string());
     }
 
     // Handle slash commands
-    match handle_slash_command(&input) {
-        Some(result) => Ok(result),
-        None => Ok(InputResult::Message(input.trim().to_string())),
+    match handle_slash_command(input) {
+        Some(result) => result,
+        None => InputResult::Message(input.trim().to_string()),
     }
 }
 
@@ -234,8 +290,21 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EXTENSION: &str = "/extension ";
     const CMD_BUILTIN: &str = "/builtin ";
     const CMD_MODE: &str = "/mode ";
+    const CMD_PERMISSIONS: &str = "/permissions";
     const CMD_MODEL: &str = "/model";
     const CMD_MODEL_WITH_SPACE: &str = "/model ";
+    const CMD_THINK: &str = "/think";
+    const CMD_IMAGE: &str = "/image";
+    const CMD_IMAGES: &str = "/images";
+    const CMD_CD: &str = "/cd";
+    const CMD_NEW: &str = "/new";
+    const CMD_RESUME: &str = "/resume";
+    const CMD_FORK: &str = "/fork";
+    const CMD_RENAME: &str = "/rename";
+    const CMD_REVIEW: &str = "/review";
+    const CMD_QUEUE: &str = "/queue";
+    const CMD_STOP: &str = "/stop";
+    const CMD_AGENT: &str = "/agent";
     const CMD_PLAN: &str = "/plan";
     const CMD_ENDPLAN: &str = "/endplan";
     const CMD_CLEAR: &str = "/clear";
@@ -301,6 +370,10 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s.starts_with(CMD_MODE) => Some(InputResult::GooseMode(
             s.get(CMD_MODE.len()..).unwrap_or("").to_string(),
         )),
+        s if s == CMD_PERMISSIONS => Some(InputResult::Permissions(None)),
+        s if s.starts_with("/permissions ") => Some(InputResult::Permissions(parse_optional_text(
+            s.strip_prefix("/permissions ").unwrap_or_default(),
+        ))),
         s if s == CMD_MODEL => Some(InputResult::Model(ModelCommandOptions::default())),
         s if s.starts_with(CMD_MODEL_WITH_SPACE) => {
             let rest = s
@@ -330,6 +403,74 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
                 }))
             }
         }
+        s if s == CMD_THINK => Some(InputResult::Thinking(None)),
+        s if s.starts_with("/think ") => Some(InputResult::Thinking(Some(
+            s.strip_prefix("/think ")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        ))),
+        s if s == CMD_IMAGE => Some(InputResult::AttachImages(Vec::new())),
+        s if s.starts_with("/image ") => Some(InputResult::AttachImages(
+            shlex::split(s.strip_prefix("/image ").unwrap_or_default()).unwrap_or_default(),
+        )),
+        s if s == CMD_IMAGES => Some(InputResult::Images(None)),
+        s if s.starts_with("/images ") => Some(InputResult::Images(parse_optional_text(
+            s.strip_prefix("/images ").unwrap_or_default(),
+        ))),
+        "/pwd" => Some(InputResult::PrintWorkingDirectory),
+        s if s == CMD_CD => Some(InputResult::ChangeDirectory(None)),
+        s if s.starts_with("/cd ") => {
+            let args = shlex::split(s.strip_prefix("/cd ").unwrap_or_default());
+            match args {
+                Some(parts) if parts.len() == 1 => {
+                    Some(InputResult::ChangeDirectory(parts.into_iter().next()))
+                }
+                _ => Some(InputResult::ChangeDirectory(Some(String::new()))),
+            }
+        }
+        s if s == CMD_NEW => Some(InputResult::NewSession(None)),
+        s if s.starts_with("/new ") => Some(InputResult::NewSession(parse_optional_text(
+            s.strip_prefix("/new ").unwrap_or_default(),
+        ))),
+        s if s == CMD_RESUME => Some(InputResult::ResumeSession(None)),
+        s if s.starts_with("/resume ") => Some(InputResult::ResumeSession(parse_optional_text(
+            s.strip_prefix("/resume ").unwrap_or_default(),
+        ))),
+        s if s == CMD_FORK => Some(InputResult::ForkSession(None)),
+        s if s.starts_with("/fork ") => Some(InputResult::ForkSession(parse_optional_text(
+            s.strip_prefix("/fork ").unwrap_or_default(),
+        ))),
+        s if s == CMD_RENAME => Some(InputResult::RenameSession(String::new())),
+        s if s.starts_with("/rename ") => Some(InputResult::RenameSession(
+            s.strip_prefix("/rename ")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        )),
+        "/sessions" => Some(InputResult::ListSessions),
+        "/diff" => Some(InputResult::Diff),
+        s if s == CMD_REVIEW => Some(InputResult::Review(None)),
+        s if s.starts_with("/review ") => Some(InputResult::Review(parse_optional_text(
+            s.strip_prefix("/review ").unwrap_or_default(),
+        ))),
+        s if s == CMD_QUEUE => Some(InputResult::Queue(None)),
+        s if s.starts_with("/queue ") => Some(InputResult::Queue(parse_optional_text(
+            s.strip_prefix("/queue ").unwrap_or_default(),
+        ))),
+        "/ps" => Some(InputResult::ProcessList),
+        s if s == CMD_STOP => Some(InputResult::StopProcess(String::new())),
+        s if s.starts_with("/stop ") => Some(InputResult::StopProcess(
+            s.strip_prefix("/stop ")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        )),
+        "/agents" | "/subagents" => Some(InputResult::Subagents),
+        s if s == CMD_AGENT => Some(InputResult::Agent(None)),
+        s if s.starts_with("/agent ") => Some(InputResult::Agent(parse_optional_text(
+            s.strip_prefix("/agent ").unwrap_or_default(),
+        ))),
         s if s.starts_with(CMD_PLAN) => {
             parse_plan_command(s.get(CMD_PLAN.len()..).unwrap_or("").trim().to_string())
         }
@@ -366,6 +507,11 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         }
         _ => None,
     }
+}
+
+fn parse_optional_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn parse_recipe_command(s: &str) -> Option<InputResult> {
@@ -475,8 +621,26 @@ fn help_text() -> String {
 /prompts [--extension <name>] - List all available prompts, optionally filtered by extension
 /prompt <n> [--info] [key=value...] - Get prompt info or execute a prompt
 /mode <name> - Set the goose mode to use ({modes})
-/model [name] - Show the current model, or switch models for this session while keeping the same provider
+/permissions [ask|accept-edit|no-perms|read-only] - Show or change this session's approval policy
+/model [name] - Open the model picker, or switch directly by name for this session
 /model --provider <name> [model] - Switch to a different provider (optionally specifying a model)
+/think [off|low|medium|high|max] - Show or set reasoning effort for this session
+/image <path> [path ...] - Attach up to four PNG, JPEG, or WebP files to the next message
+/images [clear] - List or clear images attached to the next message
+/cd [directory] - Change the active working directory (with no argument, use your home directory)
+/pwd - Show the active working directory
+/new [name] - Start a durable empty session, optionally with a name
+/resume [name-or-id] - Switch to a saved session (with no argument, open a picker)
+/fork [name] - Copy this conversation into a new durable session
+/rename <name> - Rename the current session
+/sessions - List saved sessions and their IDs
+/diff - Show staged, unstaged, and untracked working-tree changes
+/review [instructions] - Review the current working-tree changes in this session
+/queue [message|clear] - Queue steering guidance for the next agent turn, show it, or clear it
+/ps - List background terminal processes through the governed process tools
+/stop <process-id> - Stop a background process through the governed process tools
+/subagents - Inspect available agents and running delegated tasks
+/agent <instructions> - Start a governed background subagent (use 'stop <task-id>' to cancel)
 /plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
                         To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
@@ -494,8 +658,10 @@ fn help_text() -> String {
 /clear - Clears the current chat history
 
 Navigation:
-Enter - Send message
+Enter - Send a message; while a response streams, steer the active turn
+Tab - While a response streams, queue the composed message as the next turn
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
+Shift+Tab - Cycle reasoning effort (the current prompt is preserved)
 Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Up/Down arrows - Navigate through command history"
     )
@@ -663,6 +829,48 @@ mod tests {
             panic!("Expected Model with extra whitespace handled");
         }
 
+        assert!(matches!(
+            handle_slash_command("/think"),
+            Some(InputResult::Thinking(None))
+        ));
+        assert!(matches!(
+            handle_slash_command("/think high"),
+            Some(InputResult::Thinking(Some(effort))) if effort == "high"
+        ));
+        assert!(matches!(
+            handle_slash_command("/image"),
+            Some(InputResult::AttachImages(paths)) if paths.is_empty()
+        ));
+        assert!(matches!(
+            handle_slash_command(r#"/image screen.png "other view.webp""#),
+            Some(InputResult::AttachImages(paths))
+                if paths == vec!["screen.png", "other view.webp"]
+        ));
+        assert!(matches!(
+            handle_slash_command("/images"),
+            Some(InputResult::Images(None))
+        ));
+        assert!(matches!(
+            handle_slash_command("/images clear"),
+            Some(InputResult::Images(Some(action))) if action == "clear"
+        ));
+        assert!(matches!(
+            handle_slash_command("/pwd"),
+            Some(InputResult::PrintWorkingDirectory)
+        ));
+        assert!(matches!(
+            handle_slash_command("/cd"),
+            Some(InputResult::ChangeDirectory(None))
+        ));
+        assert!(matches!(
+            handle_slash_command(r#"/cd "../other project""#),
+            Some(InputResult::ChangeDirectory(Some(path))) if path == "../other project"
+        ));
+        assert!(matches!(
+            handle_slash_command("/cd one two"),
+            Some(InputResult::ChangeDirectory(Some(path))) if path.is_empty()
+        ));
+
         // Test unknown commands
         assert!(handle_slash_command("/unknown").is_none());
     }
@@ -671,6 +879,34 @@ mod tests {
     fn help_lists_builtin_agent_commands() {
         let help = help_text();
 
+        for expected in [
+            "/model",
+            "/think",
+            "/image",
+            "/images",
+            "/cd",
+            "/pwd",
+            "/new",
+            "/resume",
+            "/fork",
+            "/rename",
+            "/sessions",
+            "/diff",
+            "/review",
+            "/queue",
+            "/permissions",
+            "/ps",
+            "/stop",
+            "/agent",
+            "/subagents",
+            "Shift+Tab",
+        ] {
+            assert!(
+                help.contains(expected),
+                "help output should list {expected}"
+            );
+        }
+
         for command in goose::agents::execute_commands::list_commands() {
             assert!(
                 help.contains(&format!("/{}", command.name)),
@@ -678,6 +914,87 @@ mod tests {
                 command.name
             );
         }
+    }
+
+    #[test]
+    fn parses_session_lifecycle_commands_without_prefix_collisions() {
+        assert!(matches!(
+            handle_slash_command("/new"),
+            Some(InputResult::NewSession(None))
+        ));
+        assert!(matches!(
+            handle_slash_command("/new auth cleanup"),
+            Some(InputResult::NewSession(Some(name))) if name == "auth cleanup"
+        ));
+        assert!(matches!(
+            handle_slash_command("/resume abc123"),
+            Some(InputResult::ResumeSession(Some(selector))) if selector == "abc123"
+        ));
+        assert!(matches!(
+            handle_slash_command("/fork safer parser"),
+            Some(InputResult::ForkSession(Some(name))) if name == "safer parser"
+        ));
+        assert!(matches!(
+            handle_slash_command("/rename release readiness"),
+            Some(InputResult::RenameSession(name)) if name == "release readiness"
+        ));
+        assert!(matches!(
+            handle_slash_command("/sessions"),
+            Some(InputResult::ListSessions)
+        ));
+        assert!(matches!(
+            handle_slash_command("/diff"),
+            Some(InputResult::Diff)
+        ));
+        assert!(matches!(
+            handle_slash_command("/review focus on races"),
+            Some(InputResult::Review(Some(instructions))) if instructions == "focus on races"
+        ));
+        assert!(matches!(
+            handle_slash_command("/queue change the API name"),
+            Some(InputResult::Queue(Some(message))) if message == "change the API name"
+        ));
+
+        for unknown in [
+            "/newer",
+            "/resumable",
+            "/forklift",
+            "/renamed",
+            "/sessions-old",
+            "/diffstat",
+            "/reviewer",
+            "/queued",
+        ] {
+            assert!(handle_slash_command(unknown).is_none(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn parses_runtime_permission_and_subagent_commands() {
+        assert!(matches!(
+            handle_slash_command("/permissions"),
+            Some(InputResult::Permissions(None))
+        ));
+        assert!(matches!(
+            handle_slash_command("/permissions accept-edit"),
+            Some(InputResult::Permissions(Some(policy))) if policy == "accept-edit"
+        ));
+        assert!(matches!(
+            handle_slash_command("/ps"),
+            Some(InputResult::ProcessList)
+        ));
+        assert!(matches!(
+            handle_slash_command("/stop 123"),
+            Some(InputResult::StopProcess(process)) if process == "123"
+        ));
+        assert!(matches!(
+            handle_slash_command("/subagents"),
+            Some(InputResult::Subagents)
+        ));
+        assert!(matches!(
+            handle_slash_command("/agent inspect auth"),
+            Some(InputResult::Agent(Some(instructions))) if instructions == "inspect auth"
+        ));
     }
 
     #[test]

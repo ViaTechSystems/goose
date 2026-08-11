@@ -360,6 +360,14 @@ async fn handle_resumed_session_workdir(agent: &Agent, session_id: &str, interac
             process::exit(1);
         });
 
+    if let Err(error) = validate_governed_workdir(&session.working_dir) {
+        output::render_error(&format!(
+            "Cannot resume a session outside the authorized workspace: {}",
+            error
+        ));
+        process::exit(1);
+    }
+
     let current_workdir = std::env::current_dir().unwrap_or_else(|e| {
         output::render_error(&format!("Failed to get current working directory: {}", e));
         process::exit(1);
@@ -411,6 +419,13 @@ async fn handle_resumed_session_workdir(agent: &Agent, session_id: &str, interac
     }
 }
 
+fn validate_governed_workdir(path: &std::path::Path) -> anyhow::Result<()> {
+    if super::governed_workspace_root()?.is_some() {
+        super::enforce_governed_workspace(path)?;
+    }
+    Ok(())
+}
+
 async fn collect_extension_configs(
     agent: &Agent,
     session_config: &SessionBuilderConfig,
@@ -446,7 +461,37 @@ async fn collect_extension_configs(
     }
     all.extend(cli_flag_extensions.into_iter().map(|(_, cfg)| cfg));
 
+    validate_governed_extensions(&all)
+        .map_err(|error| ExtensionError::ConfigError(error.to_string()))?;
+
     Ok(all)
+}
+
+fn validate_governed_extensions(extensions: &[ExtensionConfig]) -> anyhow::Result<()> {
+    let governed = super::governed_workspace_root()?.is_some();
+    if !governed {
+        return Ok(());
+    }
+
+    let blocked: Vec<String> = extensions
+        .iter()
+        .filter(|extension| {
+            extension.name().eq_ignore_ascii_case("developer")
+                || matches!(
+                    extension,
+                    ExtensionConfig::Stdio { .. } | ExtensionConfig::InlinePython { .. }
+                )
+        })
+        .map(ExtensionConfig::name)
+        .collect();
+    if blocked.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "ExactCode-governed sessions cannot load raw developer or dynamic local extensions: {}",
+        blocked.join(", ")
+    )
 }
 
 async fn resolve_and_load_extensions(
@@ -502,6 +547,21 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
 
     let config = Config::global();
     let agent: Agent = Agent::new();
+
+    let initial_workdir = std::env::current_dir().unwrap_or_else(|error| {
+        output::render_error(&format!(
+            "Failed to get current working directory: {}",
+            error
+        ));
+        process::exit(1);
+    });
+    if let Err(error) = validate_governed_workdir(&initial_workdir) {
+        output::render_error(&format!(
+            "Cannot start outside the authorized workspace: {}",
+            error
+        ));
+        process::exit(1);
+    }
 
     if session_config.container.is_some() {
         agent.set_container(session_config.container.clone()).await;
@@ -595,24 +655,24 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
                     ),
                     Err(e2) => {
                         output::render_error(&format!(
-                        "Error {}.\n\
+                            "Error {}.\n\
                         Please check your system keychain and run 'goose configure' again.\n\
                         If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
                         For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
-                        e2
-                    ));
+                            e2
+                        ));
                         process::exit(1);
                     }
                 }
             }
             Err(e) => {
                 output::render_error(&format!(
-                "Error {}.\n\
+                    "Error {}.\n\
                 Please check your system keychain and run 'goose configure' again.\n\
                 If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
                 For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
-                e
-            ));
+                    e
+                ));
                 process::exit(1);
             }
         };
@@ -811,5 +871,55 @@ mod tests {
         assert_eq!(truncate_with_ellipsis("hello world", 5), "hello…");
 
         assert_eq!(truncate_with_ellipsis("", 5), "");
+    }
+
+    #[test]
+    fn governed_builder_rejects_local_extensions_and_outside_workdirs() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let workspace_string = workspace.to_string_lossy().to_string();
+        let _guard = env_lock::lock_env([
+            (super::super::GOVERNED_SESSION_ENV, Some("1")),
+            (
+                super::super::GOVERNED_WORKSPACE_ENV,
+                Some(workspace_string.as_str()),
+            ),
+        ]);
+
+        let host = ExtensionConfig::streamable_http(
+            "exactcode-host",
+            "http://127.0.0.1:8080/mcp",
+            "governed host tools",
+            30_u64,
+        );
+        assert!(validate_governed_extensions(&[host]).is_ok());
+        assert!(validate_governed_extensions(&[ExtensionConfig::stdio(
+            "untrusted",
+            "sh",
+            "local process",
+            30_u64,
+        )])
+        .is_err());
+        assert!(validate_governed_extensions(&[ExtensionConfig::default()]).is_err());
+        assert!(validate_governed_workdir(&workspace).is_ok());
+        assert!(validate_governed_workdir(&outside).is_err());
+    }
+
+    #[test]
+    fn ordinary_builder_keeps_dynamic_extensions_available() {
+        let _guard = env_lock::lock_env([
+            (super::super::GOVERNED_SESSION_ENV, None::<&str>),
+            (super::super::GOVERNED_WORKSPACE_ENV, None::<&str>),
+        ]);
+        assert!(validate_governed_extensions(&[ExtensionConfig::stdio(
+            "normal",
+            "echo",
+            "ordinary Goose behavior",
+            30_u64,
+        )])
+        .is_ok());
     }
 }

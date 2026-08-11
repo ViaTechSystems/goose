@@ -523,6 +523,14 @@ impl Agent {
         self.steer_queues.lock().await.remove(session_id);
     }
 
+    pub async fn pending_steer_count(&self, session_id: &str) -> usize {
+        let queue = self.steer_queues.lock().await.get(session_id).cloned();
+        match queue {
+            Some(queue) => queue.lock().await.len(),
+            None => 0,
+        }
+    }
+
     pub(crate) async fn has_pending_steers(&self, session_id: &str) -> bool {
         let queue = self.steer_queues.lock().await.get(session_id).cloned();
         match queue {
@@ -1964,13 +1972,18 @@ impl Agent {
                         &response.clone().with_visibility(true, false),
                     )
                     .await?;
-                let goal_text = crate::agents::execute_commands::parse_slash_command(&message_text)
-                    .map(|parsed| parsed.params_str.to_string())
-                    .unwrap_or_default();
+                let kickoff_text =
+                    if let Some(goal) = self.get_session_goal(&session_config.id).await? {
+                        super::goal::kickoff_prompt(&goal)
+                    } else {
+                        let goal_text =
+                            crate::agents::execute_commands::parse_slash_command(&message_text)
+                                .map(|parsed| parsed.params_str.to_string())
+                                .unwrap_or_default();
+                        format!("Start working toward this goal now:\n\n**Goal:** {goal_text}")
+                    };
                 let kickoff = Message::user()
-                    .with_text(format!(
-                        "Start working toward this goal now:\n\n**Goal:** {goal_text}"
-                    ))
+                    .with_text(kickoff_text)
                     .with_visibility(false, true);
                 session_manager
                     .add_message(&session_config.id, &kickoff)
@@ -2669,7 +2682,18 @@ impl Agent {
                                                                 }
                                                                 if let Some(response) = request_to_response_map.get_mut(&request_id) {
                                                                     let metadata = request_metadata.get(&request_id).and_then(|m| m.as_ref());
-                                                                    response.add_tool_response_with_metadata(request_id, output, metadata);
+                                                                    response.add_tool_response_with_metadata(request_id.clone(), output, metadata);
+                                                                    if let Some(request) = frontend_requests
+                                                                        .iter()
+                                                                        .chain(remaining_requests.iter())
+                                                                        .find(|request| request.id == request_id)
+                                                                    {
+                                                                        super::goal::bind_verification_snapshot(
+                                                                            &working_dir,
+                                                                            request,
+                                                                            response,
+                                                                        );
+                                                                    }
                                                                 }
                                                             }
                                                             ToolStreamItem::Message(msg) => {
@@ -3094,23 +3118,99 @@ impl Agent {
                             // continue from last user message after recovery compact
                         }
                         None if self.has_pending_steers(&session_config.id).await => {}
+                        None if self
+                            .get_session_goal(&session_config.id)
+                            .await?
+                            .is_some_and(|goal| goal.is_active()) => {
+                            let mut goal = self
+                                .get_session_goal(&session_config.id)
+                                .await?
+                                .expect("active goal checked above");
+                            match super::goal::parse_verdict(&last_assistant_text) {
+                                super::goal::GoalVerdict::Complete => {
+                                    if goal.evaluate_completion(&session.working_dir, &conversation) {
+                                        self.persist_session_goal(&session_config.id, &goal).await?;
+                                        self.set_goal(None).await;
+                                        yield AgentEvent::Message(
+                                            Message::assistant().with_system_notification(
+                                                SystemNotificationType::InlineMessage,
+                                                "Goal VERIFIED: completion claim and objective evidence both passed.",
+                                            )
+                                        );
+                                        exit_chat = true;
+                                    } else {
+                                        self.persist_session_goal(&session_config.id, &goal).await?;
+                                        goal_check_pending = true;
+                                        let message = Message::user()
+                                            .with_text(super::goal::verification_nudge(&goal))
+                                            .with_visibility(false, true);
+                                        push_message_with_id(&mut messages_to_add, message);
+                                        yield AgentEvent::Message(
+                                            Message::assistant().with_system_notification(
+                                                SystemNotificationType::InlineMessage,
+                                                format!("Goal evidence rejected: {}", goal.evidence.failure_reason()),
+                                            )
+                                        );
+                                    }
+                                }
+                                super::goal::GoalVerdict::Blocked => {
+                                    goal.block("the agent reported GOAL_STATUS: blocked");
+                                    self.persist_session_goal(&session_config.id, &goal).await?;
+                                    self.set_goal(None).await;
+                                    yield AgentEvent::Message(
+                                        Message::assistant().with_system_notification(
+                                            SystemNotificationType::InlineMessage,
+                                            "Goal BLOCKED and retained with its evidence.",
+                                        )
+                                    );
+                                    exit_chat = true;
+                                }
+                                super::goal::GoalVerdict::Continue => {
+                                    goal_check_pending = true;
+                                    let message = Message::user()
+                                        .with_text(super::goal::verification_nudge(&goal))
+                                        .with_visibility(false, true);
+                                    push_message_with_id(&mut messages_to_add, message);
+                                    yield AgentEvent::Message(
+                                        Message::assistant().with_system_notification(
+                                            SystemNotificationType::InlineMessage,
+                                            format!("Goal ACTIVE: {}", goal.objective),
+                                        )
+                                    );
+                                }
+                                super::goal::GoalVerdict::Unspecified if !goal_check_pending => {
+                                    goal_check_pending = true;
+                                    let message = Message::user()
+                                        .with_text(super::goal::verification_nudge(&goal))
+                                        .with_visibility(false, true);
+                                    push_message_with_id(&mut messages_to_add, message);
+                                    yield AgentEvent::Message(
+                                        Message::assistant().with_system_notification(
+                                            SystemNotificationType::InlineMessage,
+                                            format!("Goal ACTIVE: {}", goal.objective),
+                                        )
+                                    );
+                                }
+                                super::goal::GoalVerdict::Unspecified => {
+                                    // A model that does not implement the goal protocol gets one
+                                    // correction per user turn. Explicit continuation and rejected
+                                    // evidence keep running until the ordinary max-turns guard.
+                                    exit_chat = true;
+                                }
+                            }
+                        }
+
                         None if self.goal.lock().await.is_some() && !goal_check_pending => {
+                            // Compatibility for API callers that set the pre-session transient
+                            // goal directly. Interactive `/goal` uses the durable branch above.
                             goal_check_pending = true;
                             let goal = self.goal.lock().await.clone().unwrap();
-                            let nudge = format!(
-                                "Before finishing, check whether the following goal has been fully met:\n\n\
-                                 **Goal:** {goal}\n\n\
-                                 If not, continue working toward it."
-                            );
-                            let message = Message::user().with_text(&nudge)
+                            let message = Message::user()
+                                .with_text(format!(
+                                    "Before finishing, check whether this goal is fully met:\n\n**Goal:** {goal}"
+                                ))
                                 .with_visibility(false, true);
                             push_message_with_id(&mut messages_to_add, message);
-                            yield AgentEvent::Message(
-                                Message::assistant().with_system_notification(
-                                    SystemNotificationType::InlineMessage,
-                                    format!("Goal: {goal}"),
-                                )
-                            );
                         }
 
                         None if self.grind.lock().await.is_some() => {
@@ -3132,7 +3232,9 @@ impl Agent {
                         }
 
                         None => {
-                            self.set_goal(None).await;
+                            if self.get_session_goal(&session_config.id).await?.is_none() {
+                                self.set_goal(None).await;
+                            }
                             self.set_grind(None).await;
                             // Recipe retry logic owns the turn whenever a
                             // retry_config is present: it runs success checks,
@@ -3348,6 +3450,54 @@ impl Agent {
 
     pub async fn get_goal(&self) -> Option<String> {
         self.goal.lock().await.clone()
+    }
+
+    pub(super) async fn get_session_goal(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<super::goal::GoalState>> {
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
+        Ok(super::goal::GoalState::from_session(&session))
+    }
+
+    pub(super) async fn persist_session_goal(
+        &self,
+        session_id: &str,
+        goal: &super::goal::GoalState,
+    ) -> Result<()> {
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
+        let mut extension_data = session.extension_data;
+        goal.write_to(&mut extension_data)?;
+        self.config
+            .session_manager
+            .update(session_id)
+            .extension_data(extension_data)
+            .apply()
+            .await
+    }
+
+    pub(super) async fn clear_session_goal(&self, session_id: &str) -> Result<()> {
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
+        let mut extension_data = session.extension_data;
+        extension_data.extension_states.remove("exactcode_goal.v1");
+        self.config
+            .session_manager
+            .update(session_id)
+            .extension_data(extension_data)
+            .apply()
+            .await
     }
 
     pub async fn set_grind(&self, goal: Option<String>) {
@@ -5037,9 +5187,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .steer(session_id, Message::user().with_text("queued steer"))
             .await;
         assert!(agent.has_pending_steers(session_id).await);
+        assert_eq!(agent.pending_steer_count(session_id).await, 1);
 
         agent.discard_pending_steers(session_id).await;
 
+        assert_eq!(agent.pending_steer_count(session_id).await, 0);
         assert!(
             !agent.has_pending_steers(session_id).await,
             "discarding must drop steers orphaned by a cancelled run so they cannot leak into a later prompt"

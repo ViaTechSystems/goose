@@ -1,5 +1,7 @@
 use goose::agents::execute_commands::list_commands;
 use goose::config::{Config, GooseMode};
+#[cfg(test)]
+use goose_providers::thinking::ThinkingEffort;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
@@ -208,6 +210,70 @@ impl GooseCompleter {
         self.models_completion_from_cache(&current_provider, after_cmd, line)
     }
 
+    fn complete_thinking_effort(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+        let partial = line.strip_prefix("/think").unwrap_or("").trim_start();
+        let efforts = ["off", "low", "medium", "high", "max"];
+        Ok((
+            line.len() - partial.len(),
+            efforts
+                .iter()
+                .filter(|effort| effort.starts_with(partial))
+                .map(|effort| Pair {
+                    display: effort.to_string(),
+                    replacement: format!("{effort} "),
+                })
+                .collect(),
+        ))
+    }
+
+    fn complete_permission_policy(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+        let partial = line.strip_prefix("/permissions").unwrap_or("").trim_start();
+        let policies = ["ask", "accept-edit", "no-perms", "read-only"];
+        Ok((
+            line.len() - partial.len(),
+            policies
+                .iter()
+                .filter(|policy| policy.starts_with(partial))
+                .map(|policy| Pair {
+                    display: policy.to_string(),
+                    replacement: policy.to_string(),
+                })
+                .collect(),
+        ))
+    }
+
+    fn complete_directory_path(&self, line: &str, ctx: &Context) -> Result<(usize, Vec<Pair>)> {
+        let partial = line.strip_prefix("/cd").unwrap_or("").trim_start();
+        let (start, candidates) = self
+            .filename_completer
+            .complete(partial, partial.len(), ctx)?;
+        let candidates = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.replacement.ends_with(std::path::MAIN_SEPARATOR)
+                    || candidate.replacement.ends_with('/')
+            })
+            .collect();
+        Ok((line.len() - partial.len() + start, candidates))
+    }
+
+    fn complete_session_selector(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+        let partial = line.strip_prefix("/resume").unwrap_or("").trim_start();
+        let cache = self.completion_cache.read().unwrap();
+        Ok((
+            line.len() - partial.len(),
+            cache
+                .session_selectors
+                .iter()
+                .filter(|selector| selector.starts_with(partial))
+                .map(|selector| Pair {
+                    display: selector.clone(),
+                    replacement: selector.clone(),
+                })
+                .collect(),
+        ))
+    }
+
     fn models_completion_from_cache(
         &self,
         provider_name: &str,
@@ -242,7 +308,26 @@ impl GooseCompleter {
             "/extension".to_string(),
             "/builtin".to_string(),
             "/mode".to_string(),
+            "/permissions".to_string(),
             "/model".to_string(),
+            "/think".to_string(),
+            "/image".to_string(),
+            "/images".to_string(),
+            "/cd".to_string(),
+            "/pwd".to_string(),
+            "/new".to_string(),
+            "/resume".to_string(),
+            "/fork".to_string(),
+            "/rename".to_string(),
+            "/sessions".to_string(),
+            "/diff".to_string(),
+            "/review".to_string(),
+            "/queue".to_string(),
+            "/ps".to_string(),
+            "/stop".to_string(),
+            "/agents".to_string(),
+            "/subagents".to_string(),
+            "/agent".to_string(),
             "/recipe".to_string(),
         ];
         commands.extend(
@@ -489,6 +574,52 @@ impl Completer for GooseCompleter {
                 return self.complete_model_names(line);
             }
 
+            if line.starts_with("/think") {
+                return self.complete_thinking_effort(line);
+            }
+
+            if line.starts_with("/permissions") {
+                return self.complete_permission_policy(line);
+            }
+
+            if let Some(path) = line.strip_prefix("/image ") {
+                let (start, candidates) = self.complete_file_path(path, ctx)?;
+                return Ok(("/image ".len() + start, candidates));
+            }
+
+            if let Some(partial) = line.strip_prefix("/images ") {
+                if "clear".starts_with(partial) {
+                    return Ok((
+                        "/images ".len(),
+                        vec![Pair {
+                            display: "clear".to_string(),
+                            replacement: "clear".to_string(),
+                        }],
+                    ));
+                }
+            }
+
+            if line.starts_with("/cd ") {
+                return self.complete_directory_path(line, ctx);
+            }
+
+            if line.starts_with("/resume ") {
+                return self.complete_session_selector(line);
+            }
+
+            if line.starts_with("/queue ") {
+                let partial = line.strip_prefix("/queue ").unwrap_or_default();
+                if "clear".starts_with(partial) {
+                    return Ok((
+                        "/queue ".len(),
+                        vec![Pair {
+                            display: "clear".to_string(),
+                            replacement: "clear".to_string(),
+                        }],
+                    ));
+                }
+            }
+
             if line.starts_with("/mode") {
                 return self.complete_mode_flags(line);
             }
@@ -535,7 +666,10 @@ impl Hinter for GooseCompleter {
             }
             HintStatus::Default => {
                 let newline_key = super::input::get_newline_key().to_ascii_uppercase();
-                Some(format!("Enter to send · Ctrl+{newline_key} newline"))
+                Some(format!(
+                    "Enter to send · Ctrl+{newline_key} newline · Shift+Tab reasoning ({})",
+                    cache.current_thinking_effort
+                ))
             }
         }
     }
@@ -642,6 +776,11 @@ mod tests {
             "zai".to_string(),
         ];
         cache.current_session_provider = "anthropic".to_string();
+        cache.session_selectors = vec![
+            "auth cleanup".to_string(),
+            "019abc-session-id".to_string(),
+            "release prep".to_string(),
+        ];
         cache.provider_models.insert(
             "anthropic".to_string(),
             vec!["claude-sonnet-4".to_string(), "claude-haiku-4".to_string()],
@@ -688,10 +827,50 @@ mod tests {
                 command.name
             );
         }
+        for command in [
+            "/model",
+            "/think",
+            "/image",
+            "/images",
+            "/cd",
+            "/pwd",
+            "/new",
+            "/resume",
+            "/fork",
+            "/rename",
+            "/sessions",
+            "/diff",
+            "/review",
+            "/queue",
+            "/permissions",
+            "/ps",
+            "/stop",
+            "/agent",
+            "/subagents",
+        ] {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.display == command),
+                "slash completion should list {command}"
+            );
+        }
 
         // Test no match
         let (_pos, candidates) = completer.complete_slash_commands("/nonexistent").unwrap();
         assert_eq!(candidates.len(), 0);
+    }
+
+    #[test]
+    fn completes_resume_session_names_and_ids() {
+        let completer = GooseCompleter::new(create_test_cache());
+        let (pos, candidates) = completer.complete_session_selector("/resume auth").unwrap();
+        assert_eq!(pos, "/resume ".len());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "auth cleanup");
+
+        let (_, candidates) = completer.complete_session_selector("/resume 019").unwrap();
+        assert_eq!(candidates[0].replacement, "019abc-session-id");
     }
 
     #[test]
@@ -733,6 +912,68 @@ mod tests {
         assert_eq!(pos, "/model ".len());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].display, "--provider");
+    }
+
+    #[test]
+    fn test_complete_thinking_effort() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+
+        let (pos, candidates) = completer.complete_thinking_effort("/think ").unwrap();
+        assert_eq!(pos, "/think ".len());
+        assert_eq!(candidates.len(), 5);
+
+        let (pos, candidates) = completer.complete_thinking_effort("/think m").unwrap();
+        assert_eq!(pos, "/think ".len());
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.display == "medium"));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.display == "max"));
+    }
+
+    #[test]
+    fn completes_image_management_command() {
+        let completer = GooseCompleter::new(create_test_cache());
+        let history = rustyline::history::DefaultHistory::new();
+        let context = Context::new(&history);
+
+        let (pos, candidates) = completer.complete("/images c", 9, &context).unwrap();
+
+        assert_eq!(pos, "/images ".len());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "clear");
+    }
+
+    #[test]
+    fn completes_permission_policies() {
+        let completer = GooseCompleter::new(create_test_cache());
+        let (pos, candidates) = completer
+            .complete_permission_policy("/permissions a")
+            .unwrap();
+        assert_eq!(pos, "/permissions ".len());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.display.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ask", "accept-edit"]
+        );
+    }
+
+    #[test]
+    fn default_hint_advertises_shift_tab_and_current_effort() {
+        let cache = create_test_cache();
+        cache.write().unwrap().current_thinking_effort = ThinkingEffort::High;
+        let completer = GooseCompleter::new(cache);
+        let history = rustyline::history::DefaultHistory::new();
+        let context = Context::new(&history);
+
+        let hint = completer.hint("", 0, &context).unwrap();
+
+        assert!(hint.contains("Shift+Tab reasoning (high)"));
     }
 
     #[test]

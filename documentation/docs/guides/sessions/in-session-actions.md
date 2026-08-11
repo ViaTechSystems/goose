@@ -167,7 +167,10 @@ goose may perform better when complex tasks are split into subtasks, a technique
 
     </TabItem>
     <TabItem value="cli" label="goose CLI">
-        Message queuing is not available in the goose CLI.
+        While a CLI response streams, type a draft and press **Enter** to steer
+        the active turn at its next model/tool boundary, or press **Tab** to
+        queue the draft as a distinct next turn. `/queue <message>` adds queued
+        guidance explicitly; `/queue` inspects it and `/queue clear` removes it.
     </TabItem>
 </Tabs>
 

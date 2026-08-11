@@ -32,10 +32,12 @@ goose is part of the [Agentic AI Foundation (AAIF)](https://aaif.io/) at the Lin
 
 **[Download the desktop app](https://goose-docs.ai/docs/getting-started/installation)** for macOS, Linux, and Windows.
 
-Or install the CLI:
+The ViaTech fork's first binary release has not been published yet. Until its
+checksum-backed `stable` channel exists, install the current CLI from source:
 
 ```bash
-curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli \
+  --locked --no-default-features --features rustls-tls,code-mode
 ```
 
 # Quick links

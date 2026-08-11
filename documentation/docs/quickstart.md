@@ -30,6 +30,12 @@ Let's begin 🚀
 
 ## Install goose
 
+:::note ViaTech fork release status
+The first checksum-backed ViaTech binary release has not been published yet.
+The CLI commands below install the current fork from source with Cargo. Desktop
+downloads remain upstream builds and do not include the ViaTech session controls.
+:::
+
 <Tabs>
   <TabItem value="mac" label="macOS" default>
     Choose to install the Desktop and/or CLI version of goose:
@@ -46,7 +52,7 @@ Let's begin 🚀
         Run the following command to install goose:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
       </TabItem>
     </Tabs>
@@ -71,7 +77,7 @@ Let's begin 🚀
         Run the following command to install the goose CLI on Linux:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```   
       </TabItem>
     </Tabs>
@@ -93,7 +99,7 @@ Let's begin 🚀
         Run the following command in **Git Bash**, **MSYS2**, or **PowerShell** to install the goose CLI natively on Windows:
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
         
         Learn about prerequisites in the [installation guide](/docs/getting-started/installation).

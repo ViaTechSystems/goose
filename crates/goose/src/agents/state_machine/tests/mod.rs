@@ -79,18 +79,25 @@ async fn turn_context_is_persisted_once_per_turn_and_reused_across_inferences() 
 }
 
 #[tokio::test]
-async fn goal_starts_nudges_and_clears_when_met() -> Result<()> {
+async fn goal_starts_persists_and_refuses_unverified_completion() -> Result<()> {
     let (pipeline, api) = test_pipeline().await?;
-    api.on("Start working toward this goal now")
+    api.on("Begin the ExactCode verified-execution goal now")
         .reply("did some work");
-    api.on("fully met").reply("goal is met");
+    api.on("still ACTIVE").reply("goal is met");
 
     let (pipeline, result, _) = pipeline
         .run_reconstructing_each_step("/goal finish the migration")
         .await?;
 
     assert_eq!(api.call_count(), 2);
-    assert!(pipeline.get_goal().await.is_none());
+    assert_eq!(
+        pipeline.get_goal().await.as_deref(),
+        Some("finish the migration")
+    );
+    let session = pipeline.session().await?;
+    let goal = crate::agents::goal::GoalState::from_session(&session)
+        .expect("durable goal in session extension data");
+    assert!(goal.is_active());
     result.assert_message(-1, Agent, "goal is met");
 
     let command = result
@@ -117,7 +124,7 @@ async fn goal_starts_nudges_and_clears_when_met() -> Result<()> {
         .messages()
         .iter()
         .find(|message| {
-            message.as_concat_text().contains("fully met")
+            message.as_concat_text().contains("still ACTIVE")
                 && !message.is_user_visible()
                 && message.is_agent_visible()
         })
@@ -130,6 +137,25 @@ async fn goal_starts_nudges_and_clears_when_met() -> Result<()> {
             .filter(|message| message.metadata.operation_note("retry", NUDGED).is_some())
             .count(),
         1
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_goal_continuation_runs_until_the_max_turns_guard() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    api.on("Begin the ExactCode verified-execution goal now")
+        .reply("GOAL_STATUS: continue");
+    api.on("still ACTIVE").reply("GOAL_STATUS: continue");
+
+    let result = pipeline.run(["/goal keep improving"]).await?;
+
+    assert_eq!(api.call_count(), MAX_TURNS.saturating_sub(1) as usize);
+    result.assert_message(-1, Agent, state_machine::MAX_TURNS_MESSAGE);
+    let session = pipeline.session().await?;
+    assert!(
+        crate::agents::goal::GoalState::from_session(&session).is_some_and(|goal| goal.is_active())
     );
 
     Ok(())

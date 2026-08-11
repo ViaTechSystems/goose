@@ -147,6 +147,27 @@ jobs:
           pattern: '!internal-*'
           merge-multiple: true
 
+      - name: Generate SHA-256 sidecars
+        shell: bash
+        run: |
+          mapfile -d '' assets < <(find . -maxdepth 1 -type f \( \
+            -name 'goose-*.tar.bz2' -o \
+            -name 'goose-*.tar.gz' -o \
+            -name 'goose-*.zip' -o \
+            -name 'Goose*.zip' -o \
+            -name '*.deb' -o \
+            -name '*.rpm' -o \
+            -name '*.flatpak' -o \
+            -name 'download_cli.sh' \
+          \) -print0 | sort -z)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            sha256sum "${asset#./}" > "${asset#./}.sha256"
+          done
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
@@ -159,6 +180,7 @@ jobs:
             *.rpm
             *.flatpak
             download_cli.sh
+            *.sha256
 
       # Create/update the canary release
       - name: Release canary
@@ -176,6 +198,7 @@ jobs:
             *.rpm
             *.flatpak
             download_cli.sh
+            *.sha256
           allowUpdates: true
           omitBody: true
           omitPrereleaseDuringUpdate: true

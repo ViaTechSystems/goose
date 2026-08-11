@@ -801,6 +801,20 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 - **`/t`** - Toggle between `light`, `dark`, and `ansi` themes. [More info](#themes).
 - **`/t <name>`** - Set theme directly (light, dark, ansi)
 
+**ViaTech coding-session commands:**
+- **`/model [selection]`** - Show or change the current model
+- **`/think [off|low|medium|high|max]`** - Show or change reasoning effort
+- **`/permissions [ask|accept-edit|no-perms|read-only]`** - Change session approval behavior within the host capability ceiling
+- **`/pwd`**, **`/cd <path>`** - Inspect or change the working directory; governed sessions remain inside their authorized workspace
+- **`/new [name]`**, **`/resume [name-or-id]`**, **`/fork [name]`**, **`/rename <name>`**, **`/sessions`** - Manage durable sessions
+- **`/diff`**, **`/review [instructions]`** - Inspect or review repository changes
+- **`/goal ...`** - Create, edit, pause, resume, inspect, or clear a proof-bound durable goal
+- **`/queue [message|clear]`** - Add, inspect, or clear next-turn guidance
+- **`/image <path...>`**, **`/images [clear]`** - Queue, inspect, or clear images for the next turn
+- **`/ps`**, **`/stop <process-id>`** - Inspect or stop governed background processes
+- **`/subagents`** (alias **`/agents`**), **`/agent <task>`**, **`/agent stop <id>`** - Inspect, start, or stop Summon subagents
+- **`/status`**, **`/edit`** - Inspect session state or edit conversation history
+
 **Examples:**
 ```bash
 # Create a plan for triaging test failures
@@ -873,6 +887,9 @@ goose session --name use-custom-theme
 **Session Control:**
 - **`Ctrl+C`** - Clear the current line if text is entered, interrupt the current request if processing, or exit the session if line is empty
 - **`Ctrl+J`** - Add a newline. Can customize the character via `GOOSE_CLI_NEWLINE_KEY` in the [config file](/docs/guides/config-files) (e.g. `GOOSE_CLI_NEWLINE_KEY: n`) or as an [environment variable](/docs/guides/environment-variables#session-management). Avoid "c" and common terminal shortcuts like "r", "w", "z".
+- **`Enter` while streaming** - Steer the active turn with the current draft at the next model/tool boundary
+- **`Tab` while streaming** - Queue the current draft as a distinct next turn
+- **`Shift+Tab`** - Cycle the supported reasoning effort
 
 **Navigation:**
 - **`Cmd+Up/Down arrows`** - Navigate through command history

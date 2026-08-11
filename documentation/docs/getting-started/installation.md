@@ -13,6 +13,13 @@ import { PanelLeft } from 'lucide-react';
 
 # Install goose
 
+:::note ViaTech fork release status
+The first checksum-backed ViaTech binary release has not been published yet.
+The CLI commands below install the current fork from source with Cargo; they do
+not install the upstream AAIF binary. Desktop downloads remain upstream builds
+and do not include the ViaTech coding-session controls.
+:::
+
 <Tabs>
   <TabItem value="mac" label="macOS" default>
     Choose to install the Desktop and/or CLI version of goose:
@@ -55,14 +62,14 @@ import { PanelLeft } from 'lucide-react';
         Run the following command to install the latest version of goose on macOS:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
         This script will fetch the latest version of goose and set it up on your system.
 
         If you'd like to install without interactive configuration, disable `CONFIGURE`:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
         :::tip Updating goose
@@ -107,14 +114,14 @@ import { PanelLeft } from 'lucide-react';
         Run the following command to install the goose CLI on Linux:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
         This script will fetch the latest version of goose and set it up on your system.
 
         If you'd like to install without interactive configuration, disable `CONFIGURE`:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
         :::tip Updating goose
@@ -155,20 +162,20 @@ import { PanelLeft } from 'lucide-react';
         **Git Bash / MSYS2: Standard**
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
         To install without interactive configuration, disable `CONFIGURE`:
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
         **PowerShell Installation: Standard**
         Download the PowerShell installation script to your current directory.
 
         ```powershell
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aaif-goose/goose/main/download_cli.ps1" -OutFile "download_cli.ps1";
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode;
         ```
         Then run the script to install goose:
         ```powershell
@@ -220,7 +227,7 @@ import { PanelLeft } from 'lucide-react';
 
           3. Run the goose installation script:
           ```bash
-          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+          cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
           ```
           :::tip
             If you encounter any issues on download, you might need to install `bzip2` to extract the downloaded file:
@@ -233,7 +240,7 @@ import { PanelLeft } from 'lucide-react';
           If you'd like to install without interactive configuration, disable `CONFIGURE`:
 
           ```sh
-          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+          cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
           ```
 
           If needed, add goose to your path:

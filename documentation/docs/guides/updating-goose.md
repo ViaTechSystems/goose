@@ -13,6 +13,13 @@ import LinuxDesktopInstallButtons from '@site/src/components/LinuxDesktopInstall
 
 The goose CLI and desktop apps are under active and continuous development. To get the newest features and fixes, you should periodically update your goose client using the following instructions.
 
+:::note ViaTech fork release status
+Until the first checksum-backed ViaTech binary release is published, the CLI
+source-install commands below are authoritative for this fork. Desktop update
+controls and `goose update` target upstream distribution channels and do not
+install the ViaTech session controls.
+:::
+
 <Tabs>
   <TabItem value="mac" label="macOS" default>
     <Tabs groupId="interface">
@@ -48,7 +55,7 @@ The goose CLI and desktop apps are under active and continuous development. To g
         Or you can run the [installation](/docs/getting-started/installation) script again:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
         To check your current goose version, use the following command:
@@ -95,7 +102,7 @@ The goose CLI and desktop apps are under active and continuous development. To g
         Or you can run the [installation](/docs/getting-started/installation) script again:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
         To check your current goose version, use the following command:
@@ -139,7 +146,7 @@ The goose CLI and desktop apps are under active and continuous development. To g
         Or you can run the [installation](/docs/getting-started/installation) script again in **Git Bash**, **MSYS2**, or **PowerShell** to update the goose CLI natively on Windows:
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
         
         To check your current goose version, use the following command:
@@ -154,7 +161,7 @@ The goose CLI and desktop apps are under active and continuous development. To g
         To update your WSL installation, use `goose update` or run the installation script again via WSL:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        cargo install --force --git https://github.com/ViaTechSystems/goose goose-cli --locked --no-default-features --features rustls-tls,code-mode
         ```
 
        </details>
