@@ -49,6 +49,13 @@ function hasFile(p: string): boolean {
   return fs.existsSync(p);
 }
 
+export function agenticProviderAvailable(
+  commandAvailable: boolean,
+  credentialAvailable: boolean
+): boolean {
+  return commandAvailable && credentialAvailable;
+}
+
 function getProviders(): ProviderConfig[] {
   return [
     {
@@ -84,11 +91,7 @@ function getProviders(): ProviderConfig[] {
     },
     {
       provider: 'google',
-      models: [
-        'gemini-3.5-flash',
-        'gemini-3.5-flash-lite',
-        'gemini-3.6-flash',
-      ],
+      models: ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash'],
       available: () => hasEnv('GOOGLE_API_KEY'),
     },
     {
@@ -155,7 +158,11 @@ function getProviders(): ProviderConfig[] {
       provider: 'claude-code',
       models: ['default'],
       agentic: true,
-      available: () => hasCmd('claude'),
+      available: () =>
+        agenticProviderAvailable(
+          hasCmd('claude'),
+          hasEnv('ANTHROPIC_API_KEY') || hasEnv('CLAUDE_CODE_SMOKE_TEST')
+        ),
     },
     {
       provider: 'cursor-agent',

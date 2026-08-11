@@ -92,12 +92,25 @@ jobs:
       - name: Make Binary Executable
         run: chmod +x target/debug/goose
 
+      - name: Detect live provider credentials
+        id: credentials
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [[ -n "$ANTHROPIC_API_KEY" ]]; then
+            echo "anthropic=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "anthropic=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Anthropic live tests skipped because ANTHROPIC_API_KEY is unavailable"
+          fi
+
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: '22'
 
       - name: Install agentic providers
+        if: steps.credentials.outputs.anthropic == 'true'
         run: npm install -g @anthropic-ai/claude-code @zed-industries/claude-agent-acp @zed-industries/codex-acp
 
       - name: Install Node.js Dependencies
@@ -135,6 +148,7 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
 
       - name: Run MCP Tests
+        if: steps.credentials.outputs.anthropic == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -151,6 +165,7 @@ jobs:
           bash scripts/test_mcp.sh
 
       - name: Run Subrecipe Tests
+        if: steps.credentials.outputs.anthropic == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOSE_PROVIDER: anthropic
@@ -223,15 +238,30 @@ jobs:
       - name: Make Binary Executable
         run: chmod +x target/debug/goose
 
+      - name: Detect live provider credentials
+        id: credentials
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [[ -n "$ANTHROPIC_API_KEY" ]]; then
+            echo "anthropic=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "anthropic=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Compaction tests skipped because ANTHROPIC_API_KEY is unavailable"
+          fi
+
       - name: Set up Python
+        if: steps.credentials.outputs.anthropic == 'true'
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Install uv
+        if: steps.credentials.outputs.anthropic == 'true'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
 
       - name: Run Compaction Tests
+        if: steps.credentials.outputs.anthropic == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOSE_PROVIDER: anthropic
