@@ -227,6 +227,17 @@ jobs:
           omitBody: true
           omitPrereleaseDuringUpdate: true
 
+      # Keep the mutable stable channel ref coupled to the assets just
+      # uploaded. Existing release updates do not move this tag automatically.
+      - name: Move stable channel tag to this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/git/refs/tags/stable" \
+            -f sha="$(git rev-parse HEAD)" \
+            -F force=true >/dev/null
+
       - name: Upload macOS update manifest
         if: ${{ env.ENABLE_MAC_NATIVE_AUTO_UPDATE == 'true' }}
         env:
