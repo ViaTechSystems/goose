@@ -13,16 +13,39 @@ set -euo pipefail
 output=""
 url=""
 retries=0
+retry_delay=""
+retry_max_time=""
+connect_timeout=""
+max_time=""
+max_filesize=""
+retry_all_errors=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) output=$2; shift 2 ;;
     --retry) retries=$2; shift 2 ;;
-    --retry-delay|--retry-max-time|--connect-timeout|--max-filesize) shift 2 ;;
+    --retry-delay) retry_delay=$2; shift 2 ;;
+    --retry-max-time) retry_max_time=$2; shift 2 ;;
+    --connect-timeout) connect_timeout=$2; shift 2 ;;
+    --max-time) max_time=$2; shift 2 ;;
+    --max-filesize) max_filesize=$2; shift 2 ;;
+    --retry-all-errors) retry_all_errors=1; shift ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
 done
 [ -n "$output" ]
+[ "$retries" = 4 ]
+[ "$retry_delay" = 2 ]
+[ "$retry_max_time" = 120 ]
+[ "$connect_timeout" = 15 ]
+[ "$retry_all_errors" = 0 ]
+if [[ "$url" == *.sha256 ]]; then
+  [ "$max_time" = 120 ]
+  [ "$max_filesize" = 1024 ]
+else
+  [ "$max_time" = 600 ]
+  [ "$max_filesize" = 1073741824 ]
+fi
 if [ "${CURL_FAIL_FIRST:-0}" = 1 ] && [ ! -e "$CURL_FAIL_MARKER" ]; then
   : > "$CURL_FAIL_MARKER"
   [ "$retries" -ge 1 ] || exit 22
