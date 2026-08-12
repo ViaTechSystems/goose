@@ -19,17 +19,24 @@ if [ "$MODE" = deterministic ]; then
   exit 17
 fi
 if [ "$MODE" = persistent ] || [ "$count" -lt 2 ]; then
-  echo "HTTPError: Response code 502 (Bad Gateway)" >&2
+  echo "${ERROR_TEXT:-HTTPError: Response code 502 (Bad Gateway)}" >&2
   exit 42
 fi
 EOF
 chmod +x "$root/flaky"
 
-COUNTER="$counter" ARGS_FILE="$args_file" MODE=eventual RETRY_TRANSIENT_DELAYS="0 0" \
-  bash scripts/retry-transient.sh "$root/flaky" "argument with spaces" tail
-test "$(cat "$counter")" = 2
-printf 'argument with spaces\ntail\n' > "$root/expected-args"
-cmp "$root/expected-args" "$args_file"
+for error_text in \
+  "HTTPError: Response code 502 (Bad Gateway)" \
+  "RequestError: socket hang up" \
+  "could not download to cache: EOF"; do
+  rm -f "$counter"
+  COUNTER="$counter" ARGS_FILE="$args_file" MODE=eventual ERROR_TEXT="$error_text" \
+    RETRY_TRANSIENT_DELAYS="0 0" \
+    bash scripts/retry-transient.sh "$root/flaky" "argument with spaces" tail
+  test "$(cat "$counter")" = 2
+  printf 'argument with spaces\ntail\n' > "$root/expected-args"
+  cmp "$root/expected-args" "$args_file"
+done
 
 rm -f "$counter"
 set +e
