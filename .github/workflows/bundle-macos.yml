@@ -69,6 +69,7 @@ jobs:
     runs-on: ${{ inputs.target == 'x86_64-apple-darwin' && 'macos-15-intel' || 'macos-latest' }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
+      ELECTRON_CACHE: ${{ github.workspace }}/.cache/electron
     permissions:
       contents: read
     steps:
@@ -241,12 +242,13 @@ jobs:
           path: |
             ui/desktop/node_modules
             .hermit/node/cache
-          key: ${{ inputs.target == 'x86_64-apple-darwin' && 'intel-pnpm-cache-v1' || 'macos-pnpm-cache-v1' }}-${{ runner.os }}-${{ hashFiles('ui/pnpm-lock.yaml') }}
+            .cache/electron
+          key: ${{ inputs.target == 'x86_64-apple-darwin' && 'intel-pnpm-cache-v2' || 'macos-pnpm-cache-v2' }}-${{ runner.os }}-${{ hashFiles('ui/pnpm-lock.yaml') }}
           restore-keys: |
-            ${{ inputs.target == 'x86_64-apple-darwin' && 'intel-pnpm-cache-v1' || 'macos-pnpm-cache-v1' }}-${{ runner.os }}-
+            ${{ inputs.target == 'x86_64-apple-darwin' && 'intel-pnpm-cache-v2' || 'macos-pnpm-cache-v2' }}-${{ runner.os }}-
 
       - name: Install dependencies
-        run: source ../../bin/activate-hermit && pnpm install --frozen-lockfile
+        run: source ../../bin/activate-hermit && ../../scripts/retry-transient.sh pnpm install --frozen-lockfile
         working-directory: ui/desktop
 
       - name: Configure for Intel build
@@ -272,18 +274,7 @@ jobs:
           BUNDLE_SCRIPT: ${{ inputs.target == 'x86_64-apple-darwin' && 'bundle:intel' || 'bundle:default' }}
         run: |
           source ../../bin/activate-hermit
-          attempt=0
-          max_attempts=2
-          until [ $attempt -ge $max_attempts ]; do
-            pnpm run "$BUNDLE_SCRIPT" && break
-            attempt=$((attempt + 1))
-            echo "Attempt $attempt failed. Retrying..."
-            sleep 5
-          done
-          if [ $attempt -ge $max_attempts ]; then
-            echo "Action failed after $max_attempts attempts."
-            exit 1
-          fi
+          ../../scripts/retry-transient.sh pnpm run "$BUNDLE_SCRIPT"
         working-directory: ui/desktop
 
       - name: Verify macOS updater resources

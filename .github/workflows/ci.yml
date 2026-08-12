@@ -26,6 +26,9 @@ jobs:
       - name: Check release version consistency
         run: bash scripts/check-release-version-consistency.sh
 
+      - name: Test bounded release-download retries
+        run: bash scripts/test_retry_transient.sh
+
   changes:
     runs-on: ubuntu-latest
     outputs:
