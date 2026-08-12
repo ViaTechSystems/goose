@@ -202,3 +202,15 @@ jobs:
           allowUpdates: true
           omitBody: true
           omitPrereleaseDuringUpdate: true
+
+      # release-action updates the release assets but intentionally leaves an
+      # existing mutable tag where it was. Move the channel ref only after all
+      # uploads succeed so the tag, attestations, and assets describe one SHA.
+      - name: Move canary channel tag to this build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/git/refs/tags/canary" \
+            -f sha="$(git rev-parse HEAD)" \
+            -F force=true >/dev/null

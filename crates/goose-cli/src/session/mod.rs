@@ -1842,11 +1842,19 @@ impl CliSession {
     async fn capture_turn_checkpoint(&self, prompt: &str) -> Result<checkpoints::TurnCheckpoint> {
         let working_dir = self.current_session_working_directory().await?;
         let authorized_root = governed_workspace_root()?;
+        let capability_mode = std::env::var("EXACTCODE_CAPABILITY_MODE").ok();
+        let approval_mode = self.agent.goose_mode().await;
+        let code_capture_block_reason = code_rewind_block_reason(
+            authorized_root.is_some(),
+            capability_mode.as_deref(),
+            approval_mode,
+        );
         checkpoints::CheckpointJournal::new(&self.session_id)?.capture(
             &working_dir,
             authorized_root.as_deref(),
             &self.messages,
             prompt,
+            code_capture_block_reason,
         )
     }
 
@@ -2012,7 +2020,7 @@ impl CliSession {
         let authorized_root = governed_workspace_root()?;
         if let Some(code) = checkpoint.code.as_ref().filter(|_| restores_code) {
             if let Err(error) =
-                checkpoints::restore_git(code, &checkpoint_working_dir, authorized_root.as_deref())
+                journal.restore_git(code, &checkpoint_working_dir, authorized_root.as_deref())
             {
                 output::render_error(&format!(
                     "Code rewind failed before conversation history changed: {error:#}. Safety checkpoint: {}",
