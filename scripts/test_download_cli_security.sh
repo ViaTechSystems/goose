@@ -12,14 +12,21 @@ cat > "$TEST_ROOT/mock-bin/curl" <<'MOCK_CURL'
 set -euo pipefail
 output=""
 url=""
+retries=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) output=$2; shift 2 ;;
+    --retry) retries=$2; shift 2 ;;
+    --retry-delay|--retry-max-time|--connect-timeout|--max-filesize) shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
 done
 [ -n "$output" ]
+if [ "${CURL_FAIL_FIRST:-0}" = 1 ] && [ ! -e "$CURL_FAIL_MARKER" ]; then
+  : > "$CURL_FAIL_MARKER"
+  [ "$retries" -ge 1 ] || exit 22
+fi
 if [[ "$url" == *.sha256 ]]; then
   printf '%s  %s\n' "$(sha256sum "$FIXTURE_ARCHIVE" | awk '{print $1}')" \
     "$(basename "${url%.sha256}")" > "$output"
@@ -50,6 +57,18 @@ run_installer() {
       bash "$REPO_ROOT/download_cli.sh" >/dev/null
   )
 }
+
+# Release-edge 5xx responses are retried by curl before the installer falls
+# back to another mutable tag. The mock simulates one transient transfer error
+# and only succeeds when the installer requested at least one curl retry.
+fixture=$(make_fixture transient-retry retry-success)
+mkdir -p "$TEST_ROOT/transient-retry/bin" "$TEST_ROOT/transient-retry/work" \
+  "$TEST_ROOT/transient-retry/tmp"
+CURL_FAIL_FIRST=1 CURL_FAIL_MARKER="$TEST_ROOT/transient-retry/failed-once" \
+  run_installer "$fixture" "$TEST_ROOT/transient-retry/bin" \
+    "$TEST_ROOT/transient-retry/work" "$TEST_ROOT/transient-retry/tmp"
+test -e "$TEST_ROOT/transient-retry/failed-once"
+test "$(cat "$TEST_ROOT/transient-retry/bin/goose")" = retry-success
 
 run_windows_installer() {
   local fixture=$1 bin_dir=$2 work_dir=$3 tmp_dir=$4 mock_dir=${5:-$TEST_ROOT/mock-bin}
