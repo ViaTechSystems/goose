@@ -33,12 +33,19 @@ while [ "$#" -gt 0 ]; do
     *) url=$1; shift ;;
   esac
 done
-[ -n "$output" ]
 [ "$retries" = 4 ]
 [ "$retry_delay" = 2 ]
 [ "$retry_max_time" = 120 ]
 [ "$connect_timeout" = 15 ]
 [ "$retry_all_errors" = 0 ]
+if [[ "$url" == https://api.github.com/*/releases/latest ]]; then
+  [ -z "$output" ]
+  [ "$max_time" = 120 ]
+  [ -z "$max_filesize" ]
+  printf '{"tag_name":"v1.46.1"}\n'
+  exit 0
+fi
+[ -n "$output" ]
 if [[ "$url" == *.sha256 ]]; then
   [ "$max_time" = 120 ]
   [ "$max_filesize" = 1024 ]
@@ -46,9 +53,9 @@ else
   [ "$max_time" = 600 ]
   [ "$max_filesize" = 1073741824 ]
 fi
-if [ "${CURL_FAIL_FIRST:-0}" = 1 ] && [ ! -e "$CURL_FAIL_MARKER" ]; then
-  : > "$CURL_FAIL_MARKER"
-  [ "$retries" -ge 1 ] || exit 22
+if [ "${CURL_FAIL_STABLE:-0}" = 1 ] && [[ "$url" == */stable/* ]] && \
+  [[ "$url" != *.sha256 ]]; then
+  exit 22
 fi
 if [[ "$url" == *.sha256 ]]; then
   printf '%s  %s\n' "$(sha256sum "$FIXTURE_ARCHIVE" | awk '{print $1}')" \
@@ -81,17 +88,16 @@ run_installer() {
   )
 }
 
-# Release-edge 5xx responses are retried by curl before the installer falls
-# back to another mutable tag. The mock simulates one transient transfer error
-# and only succeeds when the installer requested at least one curl retry.
-fixture=$(make_fixture transient-retry retry-success)
-mkdir -p "$TEST_ROOT/transient-retry/bin" "$TEST_ROOT/transient-retry/work" \
-  "$TEST_ROOT/transient-retry/tmp"
-CURL_FAIL_FIRST=1 CURL_FAIL_MARKER="$TEST_ROOT/transient-retry/failed-once" \
-  run_installer "$fixture" "$TEST_ROOT/transient-retry/bin" \
-    "$TEST_ROOT/transient-retry/work" "$TEST_ROOT/transient-retry/tmp"
-test -e "$TEST_ROOT/transient-retry/failed-once"
-test "$(cat "$TEST_ROOT/transient-retry/bin/goose")" = retry-success
+# Every release transfer carries the bounded retry policy asserted by the mock.
+# If stable remains unavailable after curl exhausts those retries, the installer
+# resolves GitHub's latest immutable release and applies a distinct metadata
+# transfer limit before fetching the same archive contract there.
+fixture=$(make_fixture retry-policy retry-success)
+mkdir -p "$TEST_ROOT/retry-policy/bin" "$TEST_ROOT/retry-policy/work" \
+  "$TEST_ROOT/retry-policy/tmp"
+CURL_FAIL_STABLE=1 run_installer "$fixture" "$TEST_ROOT/retry-policy/bin" \
+  "$TEST_ROOT/retry-policy/work" "$TEST_ROOT/retry-policy/tmp"
+test "$(cat "$TEST_ROOT/retry-policy/bin/goose")" = retry-success
 
 run_windows_installer() {
   local fixture=$1 bin_dir=$2 work_dir=$3 tmp_dir=$4 mock_dir=${5:-$TEST_ROOT/mock-bin}
