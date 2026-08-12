@@ -201,7 +201,8 @@ jobs:
             *.sha256
           allowUpdates: true
           omitBody: true
-          omitPrereleaseDuringUpdate: true
+          removeArtifacts: true
+          prerelease: true
 
       # release-action updates the release assets but intentionally leaves an
       # existing mutable tag where it was. Move the channel ref only after all
