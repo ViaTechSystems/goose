@@ -235,7 +235,7 @@ jobs:
         run: |
           gh api --method PATCH \
             "repos/${GITHUB_REPOSITORY}/git/refs/tags/stable" \
-            -f sha="$(git rev-parse HEAD)" \
+            -f sha="${GITHUB_SHA}" \
             -F force=true >/dev/null
 
       - name: Upload macOS update manifest
