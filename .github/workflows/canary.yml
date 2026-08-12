@@ -212,5 +212,5 @@ jobs:
         run: |
           gh api --method PATCH \
             "repos/${GITHUB_REPOSITORY}/git/refs/tags/canary" \
-            -f sha="$(git rev-parse HEAD)" \
+            -f sha="${GITHUB_SHA}" \
             -F force=true >/dev/null
