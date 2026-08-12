@@ -12,14 +12,51 @@ cat > "$TEST_ROOT/mock-bin/curl" <<'MOCK_CURL'
 set -euo pipefail
 output=""
 url=""
+retries=0
+retry_delay=""
+retry_max_time=""
+connect_timeout=""
+max_time=""
+max_filesize=""
+retry_all_errors=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) output=$2; shift 2 ;;
+    --retry) retries=$2; shift 2 ;;
+    --retry-delay) retry_delay=$2; shift 2 ;;
+    --retry-max-time) retry_max_time=$2; shift 2 ;;
+    --connect-timeout) connect_timeout=$2; shift 2 ;;
+    --max-time) max_time=$2; shift 2 ;;
+    --max-filesize) max_filesize=$2; shift 2 ;;
+    --retry-all-errors) retry_all_errors=1; shift ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
 done
+[ "$retries" = 4 ]
+[ "$retry_delay" = 2 ]
+[ "$retry_max_time" = 120 ]
+[ "$connect_timeout" = 15 ]
+[ "$retry_all_errors" = 0 ]
+if [[ "$url" == https://api.github.com/*/releases/latest ]]; then
+  [ -z "$output" ]
+  [ "$max_time" = 120 ]
+  [ -z "$max_filesize" ]
+  printf '{"tag_name":"v1.46.1"}\n'
+  exit 0
+fi
 [ -n "$output" ]
+if [[ "$url" == *.sha256 ]]; then
+  [ "$max_time" = 120 ]
+  [ "$max_filesize" = 1024 ]
+else
+  [ "$max_time" = 600 ]
+  [ "$max_filesize" = 1073741824 ]
+fi
+if [ "${CURL_FAIL_STABLE:-0}" = 1 ] && [[ "$url" == */stable/* ]] && \
+  [[ "$url" != *.sha256 ]]; then
+  exit 22
+fi
 if [[ "$url" == *.sha256 ]]; then
   printf '%s  %s\n' "$(sha256sum "$FIXTURE_ARCHIVE" | awk '{print $1}')" \
     "$(basename "${url%.sha256}")" > "$output"
@@ -50,6 +87,17 @@ run_installer() {
       bash "$REPO_ROOT/download_cli.sh" >/dev/null
   )
 }
+
+# Every release transfer carries the bounded retry policy asserted by the mock.
+# If stable remains unavailable after curl exhausts those retries, the installer
+# resolves GitHub's latest immutable release and applies a distinct metadata
+# transfer limit before fetching the same archive contract there.
+fixture=$(make_fixture retry-policy retry-success)
+mkdir -p "$TEST_ROOT/retry-policy/bin" "$TEST_ROOT/retry-policy/work" \
+  "$TEST_ROOT/retry-policy/tmp"
+CURL_FAIL_STABLE=1 run_installer "$fixture" "$TEST_ROOT/retry-policy/bin" \
+  "$TEST_ROOT/retry-policy/work" "$TEST_ROOT/retry-policy/tmp"
+test "$(cat "$TEST_ROOT/retry-policy/bin/goose")" = retry-success
 
 run_windows_installer() {
   local fixture=$1 bin_dir=$2 work_dir=$3 tmp_dir=$4 mock_dir=${5:-$TEST_ROOT/mock-bin}

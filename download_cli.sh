@@ -402,10 +402,14 @@ validate_zip_archive() {
 }
 
 echo "Downloading $RELEASE_TAG release: $FILE..."
-if ! curl -sLf --max-filesize 1073741824 "$DOWNLOAD_URL" --output "$ARCHIVE_PATH"; then
+if ! curl -sLf --retry 4 --retry-delay 2 --retry-max-time 120 \
+  --connect-timeout 15 --max-time 600 --max-filesize 1073741824 \
+  "$DOWNLOAD_URL" --output "$ARCHIVE_PATH"; then
   # If the download fails, only fall back to latest stable when no version was specified and canary was not requested).
   if ! [ -n "${GOOSE_VERSION:-}" ] && [ "${CANARY:-false}" != "true" ]; then
-    LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | \
+    LATEST_TAG=$(curl -fsSL --retry 4 --retry-delay 2 --retry-max-time 120 \
+      --connect-timeout 15 --max-time 120 \
+      "https://api.github.com/repos/$REPO/releases/latest" | \
       grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$LATEST_TAG" ]; then
       echo "Error: Failed to download $DOWNLOAD_URL and latest tag unavailable"
@@ -413,7 +417,9 @@ if ! curl -sLf --max-filesize 1073741824 "$DOWNLOAD_URL" --output "$ARCHIVE_PATH
     fi
 
     DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$FILE"
-    if curl -sLf --max-filesize 1073741824 "$DOWNLOAD_URL" --output "$ARCHIVE_PATH"; then
+    if curl -sLf --retry 4 --retry-delay 2 --retry-max-time 120 \
+      --connect-timeout 15 --max-time 600 --max-filesize 1073741824 \
+      "$DOWNLOAD_URL" --output "$ARCHIVE_PATH"; then
       # Fallback succeeded
       :
     else
@@ -433,7 +439,9 @@ CHECKSUM_PATH="$TMP_DIR/$CHECKSUM_FILE"
 # does not independently authenticate a compromised release account. Installed
 # Goose updates additionally require the fork's Sigstore/SLSA attestation.
 echo "Downloading SHA-256 checksum: $CHECKSUM_FILE..."
-if ! curl -sLf --max-filesize 1024 "$CHECKSUM_URL" --output "$CHECKSUM_PATH"; then
+if ! curl -sLf --retry 4 --retry-delay 2 --retry-max-time 120 \
+  --connect-timeout 15 --max-time 120 --max-filesize 1024 \
+  "$CHECKSUM_URL" --output "$CHECKSUM_PATH"; then
   echo "Error: Failed to download required checksum from $CHECKSUM_URL"
   exit 1
 fi
