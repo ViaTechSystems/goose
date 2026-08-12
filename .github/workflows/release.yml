@@ -212,6 +212,7 @@ jobs:
         with:
           tag: stable
           name: Stable
+          commit: ${{ github.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: |
             goose-*.tar.bz2
@@ -226,6 +227,7 @@ jobs:
           allowUpdates: true
           omitBody: true
           omitPrereleaseDuringUpdate: true
+          removeArtifacts: true
 
       # Keep the mutable stable channel ref coupled to the assets just
       # uploaded. Existing release updates do not move this tag automatically.
